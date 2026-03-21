@@ -3,6 +3,7 @@ mod ws2812;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Condvar, Mutex};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -66,18 +67,12 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812) {
     info!("Client disconnected");
 }
 
-fn main() {
-    esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
-
-    let peripherals = Peripherals::take().unwrap();
+fn wifi_task(modem: esp_idf_svc::hal::modem::Modem, ready: Arc<(Mutex<bool>, Condvar)>) {
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    let mut led = Ws2812::new(peripherals.pins.gpio8).unwrap();
-
     let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs)).unwrap(),
+        EspWifi::new(modem, sys_loop.clone(), Some(nvs)).unwrap(),
         sys_loop,
     ).unwrap();
 
@@ -91,19 +86,40 @@ fn main() {
     wifi.start().unwrap();
 
     loop {
-        match wifi.connect() {
-            Ok(_) => break,
-            Err(e) => {
-                info!("WiFi connect failed: {e:?}, retrying...");
-                std::thread::sleep(std::time::Duration::from_secs(1));
+        if !wifi.is_connected().unwrap_or(false) {
+            info!("WiFi connecting...");
+            match wifi.connect() {
+                Ok(_) => {
+                    wifi.wait_netif_up().unwrap();
+                    let ip = wifi.wifi().sta_netif().get_ip_info().unwrap().ip;
+                    info!("WiFi connected, IP: {ip}");
+                    let (lock, cvar) = &*ready;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_one();
+                }
+                Err(e) => {
+                    info!("WiFi connect failed: {e:?}, retrying...");
+                }
             }
         }
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
 
-    wifi.wait_netif_up().unwrap();
+fn main() {
+    esp_idf_svc::sys::link_patches();
+    esp_idf_svc::log::EspLogger::initialize_default();
 
-    let ip = wifi.wifi().sta_netif().get_ip_info().unwrap().ip;
-    info!("IP: {ip}");
+    let peripherals = Peripherals::take().unwrap();
+    let mut led = Ws2812::new(peripherals.pins.gpio8).unwrap();
+
+    let ready = Arc::new((Mutex::new(false), Condvar::new()));
+    let ready_wifi = Arc::clone(&ready);
+    std::thread::spawn(move || wifi_task(peripherals.modem, ready_wifi));
+
+    // Wait for first WiFi connection before binding
+    let (lock, cvar) = &*ready;
+    drop(cvar.wait_while(lock.lock().unwrap(), |connected| !*connected).unwrap());
 
     let listener = TcpListener::bind(format!("0.0.0.0:{TCP_PORT}")).unwrap();
     info!("TCP server on port {TCP_PORT}");
