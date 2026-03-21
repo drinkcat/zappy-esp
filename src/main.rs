@@ -1,7 +1,7 @@
 mod secrets;
 mod ws2812;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -44,16 +44,23 @@ fn handle_command(led: &mut Ws2812, cmd: &str) {
 
 fn handle_client(mut stream: TcpStream, led: &mut Ws2812) {
     info!("Client connected: {}", stream.peer_addr().unwrap());
-    stream.write_all(b"ESP32-C6 LED controller. Commands: red, green, blue, white, off, r,g,b\n").unwrap();
+    stream.write_all(b"ESP32-C6 LED controller. Commands: red, green, blue, white, off, r,g,b\n").ok();
 
-    let reader = BufReader::new(stream.try_clone().unwrap());
-    for line in reader.lines() {
-        match line {
-            Ok(cmd) => {
-                handle_command(led, &cmd);
-                stream.write_all(b"ok\n").unwrap();
+    let mut line = String::new();
+    let mut buf = [0u8; 1];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let ch = buf[0] as char;
+                if ch == '\n' {
+                    handle_command(led, &line);
+                    stream.write_all(b"ok\n").ok();
+                    line.clear();
+                } else if ch != '\r' {
+                    line.push(ch);
+                }
             }
-            Err(_) => break,
         }
     }
     info!("Client disconnected");
@@ -82,7 +89,17 @@ fn main() {
     })).unwrap();
 
     wifi.start().unwrap();
-    wifi.connect().unwrap();
+
+    loop {
+        match wifi.connect() {
+            Ok(_) => break,
+            Err(e) => {
+                info!("WiFi connect failed: {e:?}, retrying...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+
     wifi.wait_netif_up().unwrap();
 
     let ip = wifi.wifi().sta_netif().get_ip_info().unwrap().ip;
