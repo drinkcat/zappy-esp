@@ -1,5 +1,4 @@
 mod secrets;
-mod ws2812;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -12,7 +11,9 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
 use smart_leds_trait::{SmartLedsWrite, RGB8};
-use ws2812::Ws2812;
+use ws2812_esp32_rmt_driver::driver::color::LedPixelColorRgb24;
+use ws2812_esp32_rmt_driver::LedPixelEsp32Rmt;
+type Ws2812 = LedPixelEsp32Rmt<'static, RGB8, LedPixelColorRgb24>;
 
 const TCP_PORT: u16 = 1234;
 
@@ -117,7 +118,7 @@ fn main() {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take().unwrap();
-    let mut led = Ws2812::new(peripherals.pins.gpio8).unwrap();
+    let mut led = Ws2812::new(peripherals.rmt.channel0, peripherals.pins.gpio8).unwrap();
 
     let reconnect = Arc::new(AtomicBool::new(false));
     let ready = Arc::new((Mutex::new(false), Condvar::new()));
