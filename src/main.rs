@@ -3,6 +3,7 @@ mod ws2812;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -19,7 +20,7 @@ fn set_color(led: &mut Ws2812, r: u8, g: u8, b: u8) {
     led.write(std::iter::once(RGB8 { r, g, b })).unwrap();
 }
 
-fn handle_command(led: &mut Ws2812, cmd: &str) {
+fn handle_command(led: &mut Ws2812, reconnect: &AtomicBool, cmd: &str) {
     let cmd = cmd.trim();
     info!("cmd: {cmd}");
     match cmd {
@@ -28,6 +29,7 @@ fn handle_command(led: &mut Ws2812, cmd: &str) {
         "blue"  => set_color(led, 0, 0, 255),
         "white" => set_color(led, 255, 255, 255),
         "off"   => set_color(led, 0, 0, 0),
+        "reconnect" => reconnect.store(true, Ordering::Relaxed),
         _ => {
             let parts: Vec<&str> = cmd.splitn(3, ',').collect();
             if parts.len() == 3 {
@@ -43,9 +45,9 @@ fn handle_command(led: &mut Ws2812, cmd: &str) {
     }
 }
 
-fn handle_client(mut stream: TcpStream, led: &mut Ws2812) {
+fn handle_client(mut stream: TcpStream, led: &mut Ws2812, reconnect: &AtomicBool) {
     info!("Client connected: {}", stream.peer_addr().unwrap());
-    stream.write_all(b"ESP32-C6 LED controller. Commands: red, green, blue, white, off, r,g,b\n").ok();
+    stream.write_all(b"ESP32-C6 LED controller. Commands: red, green, blue, white, off, r,g,b, reconnect\n").ok();
 
     let mut line = String::new();
     let mut buf = [0u8; 1];
@@ -55,7 +57,7 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812) {
             Ok(_) => {
                 let ch = buf[0] as char;
                 if ch == '\n' {
-                    handle_command(led, &line);
+                    handle_command(led, reconnect, &line);
                     stream.write_all(b"ok\n").ok();
                     line.clear();
                 } else if ch != '\r' {
@@ -67,7 +69,7 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812) {
     info!("Client disconnected");
 }
 
-fn wifi_task(modem: esp_idf_svc::hal::modem::Modem, ready: Arc<(Mutex<bool>, Condvar)>) {
+fn wifi_task(modem: esp_idf_svc::hal::modem::Modem, ready: Arc<(Mutex<bool>, Condvar)>, reconnect: Arc<AtomicBool>) {
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
@@ -86,6 +88,10 @@ fn wifi_task(modem: esp_idf_svc::hal::modem::Modem, ready: Arc<(Mutex<bool>, Con
     wifi.start().unwrap();
 
     loop {
+        if reconnect.swap(false, Ordering::Relaxed) {
+            info!("WiFi reconnect requested, disconnecting...");
+            wifi.disconnect().ok();
+        }
         if !wifi.is_connected().unwrap_or(false) {
             info!("WiFi connecting...");
             match wifi.connect() {
@@ -113,9 +119,11 @@ fn main() {
     let peripherals = Peripherals::take().unwrap();
     let mut led = Ws2812::new(peripherals.pins.gpio8).unwrap();
 
+    let reconnect = Arc::new(AtomicBool::new(false));
     let ready = Arc::new((Mutex::new(false), Condvar::new()));
     let ready_wifi = Arc::clone(&ready);
-    std::thread::spawn(move || wifi_task(peripherals.modem, ready_wifi));
+    let reconnect_wifi = Arc::clone(&reconnect);
+    std::thread::spawn(move || wifi_task(peripherals.modem, ready_wifi, reconnect_wifi));
 
     // Wait for first WiFi connection before binding
     let (lock, cvar) = &*ready;
@@ -126,7 +134,7 @@ fn main() {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_client(stream, &mut led),
+            Ok(stream) => handle_client(stream, &mut led, &reconnect),
             Err(e) => info!("Accept error: {e}"),
         }
     }
