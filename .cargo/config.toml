@@ -3,7 +3,7 @@ target = "riscv32imac-esp-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "espflash flash --monitor -B 921600 --flash-freq 40mhz"
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]
