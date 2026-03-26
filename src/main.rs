@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
+const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
+
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{InterruptType, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -33,6 +36,7 @@ struct State {
     wifi_ready: (Mutex<bool>, Condvar),
     zap_flag: AtomicBool,       // set by ISR, cleared by zap_task
     zap_times: Mutex<Vec<SystemTime>>,
+    zap_blink_until: Mutex<Option<Instant>>,
 }
 
 impl State {
@@ -42,6 +46,7 @@ impl State {
             wifi_ready: (Mutex::new(false), Condvar::new()),
             zap_flag: AtomicBool::new(false),
             zap_times: Mutex::new(Vec::new()),
+            zap_blink_until: Mutex::new(None),
         }
     }
 }
@@ -52,9 +57,30 @@ enum Response {
     Text(String),
 }
 
-fn set_color(led: &mut Ws2812, r: u8, g: u8, b: u8) {
+// Returns true if currently in zap-blink mode and ticked the LED.
+fn tick_zap_blink(led: &mut Ws2812, state: &State, zap_blink_state: &mut bool) -> bool {
+    let until = *state.zap_blink_until.lock().unwrap();
+    match until {
+        Some(t) if Instant::now() < t => {
+            *zap_blink_state = !*zap_blink_state;
+            if *zap_blink_state {
+                set_color_raw(led, 255, 165, 0); // orange on
+            } else {
+                set_color_raw(led, 0, 0, 0);     // off
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn set_color_raw(led: &mut Ws2812, r: u8, g: u8, b: u8) {
     let scale = |c: u8| ((c as u16 * BRIGHTNESS as u16) / 255) as u8;
     led.write(std::iter::once(RGB8 { r: scale(r), g: scale(g), b: scale(b) })).unwrap();
+}
+
+fn set_color(led: &mut Ws2812, r: u8, g: u8, b: u8) {
+    set_color_raw(led, r, g, b);
 }
 
 fn handle_command(led: &mut Ws2812, state: &State, cmd: &str) -> Response {
@@ -71,8 +97,8 @@ fn handle_command(led: &mut Ws2812, state: &State, cmd: &str) -> Response {
             let times = state.zap_times.lock().unwrap();
             let n = times.len();
             let list: String = times.iter().map(|t| {
-                let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
-                format!("{secs}\n")
+                let ms = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
+                format!("{ms}\n")
             }).collect();
             Response::Text(format!("count={n}\n{list}"))
         }
@@ -96,12 +122,13 @@ fn handle_command(led: &mut Ws2812, state: &State, cmd: &str) -> Response {
 fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
     info!("Client connected: {}", stream.peer_addr().unwrap());
     stream.write_all(b"Commands: red, green, blue, white, off, r,g,b, reconnect, zaps\n").ok();
-    stream.set_read_timeout(Some(BLINK_INTERVAL)).ok();
+    stream.set_read_timeout(Some(ZAP_BLINK_INTERVAL)).ok();
 
     let mut line = String::new();
     let mut buf = [0u8; 1];
     let mut blink_state = 0usize;
     let mut last_blink = Instant::now();
+    let mut zap_blink_state = false;
 
     loop {
         match stream.read(&mut buf) {
@@ -129,7 +156,9 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
         }
 
         // Tick blink
-        if last_blink.elapsed() >= BLINK_INTERVAL {
+        if tick_zap_blink(led, state, &mut zap_blink_state) {
+            // zap blink takes priority, use fast interval
+        } else if last_blink.elapsed() >= BLINK_INTERVAL {
             let (r, g, b) = BLINK_COLORS[blink_state % BLINK_COLORS.len()];
             set_color(led, r, g, b);
             blink_state += 1;
@@ -139,7 +168,7 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
     info!("Client disconnected");
 }
 
-fn zap_task(state: Arc<State>) {
+fn zap_task(mut zap_pin: PinDriver<'static, esp_idf_svc::hal::gpio::Input>, state: Arc<State>) {
     loop {
         if state.zap_flag.swap(false, Ordering::Relaxed) {
             let t = SystemTime::now();
@@ -147,6 +176,10 @@ fn zap_task(state: Arc<State>) {
             let count = times.len() + 1;
             times.push(t);
             info!("Zap! count={count}");
+            drop(times);
+            *state.zap_blink_until.lock().unwrap() =
+                Some(Instant::now() + ZAP_BLINK_DURATION);
+            zap_pin.enable_interrupt().unwrap();
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -213,7 +246,7 @@ fn main() {
     }
     zap_pin.enable_interrupt().unwrap();
 
-    std::thread::spawn({ let s = Arc::clone(&state); move || zap_task(s) });
+    std::thread::spawn({ let s = Arc::clone(&state); move || zap_task(zap_pin, s) });
     std::thread::spawn({ let s = Arc::clone(&state); move || wifi_task(peripherals.modem, s) });
 
     // Blink while waiting for WiFi
@@ -233,9 +266,12 @@ fn main() {
     info!("TCP server on port {TCP_PORT}");
     listener.set_nonblocking(true).unwrap();
     let mut last_blink = Instant::now();
+    let mut zap_blink_state = false;
 
     loop {
-        if last_blink.elapsed() >= BLINK_INTERVAL {
+        if tick_zap_blink(&mut led, &state, &mut zap_blink_state) {
+            std::thread::sleep(ZAP_BLINK_INTERVAL);
+        } else if last_blink.elapsed() >= BLINK_INTERVAL {
             let (r, g, b) = BLINK_COLORS[blink_state % BLINK_COLORS.len()];
             set_color(&mut led, r, g, b);
             blink_state += 1;
