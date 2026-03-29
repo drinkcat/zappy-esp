@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use embedded_svc::http::client::Client as HttpClient;
-use embedded_svc::http::Method;
+use embedded_svc::io::Write as SvcWrite;
 
 const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
@@ -55,6 +55,7 @@ enum Response {
 }
 
 // Returns true if currently in zap-blink mode and ticked the LED.
+// Returns true while zap-blinking. Resets zap_blink_state to false when done.
 fn tick_zap_blink(led: &mut Ws2812, state: &State, zap_blink_state: &mut bool) -> bool {
     let until = *state.zap_blink_until.lock().unwrap();
     match until {
@@ -67,7 +68,10 @@ fn tick_zap_blink(led: &mut Ws2812, state: &State, zap_blink_state: &mut bool) -
             }
             true
         }
-        _ => false,
+        _ => {
+            *zap_blink_state = false;
+            false
+        }
     }
 }
 
@@ -147,35 +151,35 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
             }
         }
 
-        if tick_zap_blink(led, state, &mut zap_blink_state) {
-            // zap blink in progress
-        } else if zap_blink_state {
+        let was_blinking = zap_blink_state;
+        if !tick_zap_blink(led, state, &mut zap_blink_state) && was_blinking {
             set_color(led, 0, 0, 255); // restore blue after zap
-            zap_blink_state = false;
         }
     }
     info!("Client disconnected");
 }
 
-fn blynk_log_event(event_code: &str) {
+fn thingsboard_send_telemetry(key: Option<&str>) {
     let url = format!(
-        "https://blynk.cloud/external/api/logEvent?token={}&code={}",
-        secrets::BLYNK_TOKEN, event_code
+        "http://thingsboard.cloud/api/v1/{}/telemetry",
+        secrets::THINGSBOARD_TOKEN
     );
-    let conn = EspHttpConnection::new(&HttpConfig {
-        use_global_ca_store: true,
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        ..Default::default()
-    });
+    let body = key.map_or("{}".to_string(), |k| format!("{{\"{k}\":1}}"));
+
+    let conn = EspHttpConnection::new(&HttpConfig::default());
     match conn {
         Ok(conn) => {
             let mut client = HttpClient::wrap(conn);
-            match client.get(&url).and_then(|req| req.submit()) {
-                Ok(resp) => info!("Blynk event '{event_code}' sent, status={}", resp.status()),
-                Err(e) => info!("Blynk event send failed: {e:?}"),
+            let headers = [("Content-Type", "application/json")];
+            match client.post(&url, &headers).and_then(|mut req| {
+                req.write_all(body.as_bytes())?;
+                req.submit()
+            }) {
+                Ok(resp) => info!("ThingsBoard telemetry sent, status={}", resp.status()),
+                Err(e) => info!("ThingsBoard telemetry failed: {e:?}"),
             }
         }
-        Err(e) => info!("Blynk HTTP init failed: {e:?}"),
+        Err(e) => info!("ThingsBoard HTTP init failed: {e:?}"),
     }
 }
 
@@ -183,7 +187,7 @@ fn zap_task(mut zap_pin: PinDriver<'static, esp_idf_svc::hal::gpio::Input>, stat
     // Wait for WiFi before attempting HTTP
     let (lock, cvar) = &state.wifi_ready;
     let guard = lock.lock().unwrap();
-    let _ = cvar.wait_while(guard, |ready| !*ready).unwrap();
+    drop(cvar.wait_while(guard, |ready| !*ready).unwrap());
 
     loop {
         if state.zap_flag.swap(false, Ordering::Relaxed) {
@@ -195,10 +199,10 @@ fn zap_task(mut zap_pin: PinDriver<'static, esp_idf_svc::hal::gpio::Input>, stat
             drop(times);
             *state.zap_blink_until.lock().unwrap() =
                 Some(Instant::now() + ZAP_BLINK_DURATION);
-            blynk_log_event("zap");
-            // Debounce
+            // Debounce then re-arm before the HTTP call
             std::thread::sleep(Duration::from_millis(100));
             zap_pin.enable_interrupt().unwrap();
+            std::thread::spawn(|| thingsboard_send_telemetry(Some("zap")));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -282,18 +286,25 @@ fn main() {
 
     set_color(&mut led, 0, 0, 255); // solid blue when WiFi ready
 
+    std::thread::spawn(|| {
+        thingsboard_send_telemetry(Some("boot"));
+        loop {
+            std::thread::sleep(Duration::from_secs(5 * 60));
+            thingsboard_send_telemetry(None);
+        }
+    });
+
     let listener = TcpListener::bind(format!("0.0.0.0:{TCP_PORT}")).unwrap();
     info!("TCP server on port {TCP_PORT}");
     listener.set_nonblocking(true).unwrap();
     let mut zap_blink_state = false;
 
     loop {
+        let was_blinking = zap_blink_state;
         if tick_zap_blink(&mut led, &state, &mut zap_blink_state) {
             std::thread::sleep(ZAP_BLINK_INTERVAL);
-        } else if zap_blink_state {
-            // zap just ended, restore blue
-            set_color(&mut led, 0, 0, 255);
-            zap_blink_state = false;
+        } else if was_blinking {
+            set_color(&mut led, 0, 0, 255); // restore blue after zap
         }
 
         match listener.accept() {
