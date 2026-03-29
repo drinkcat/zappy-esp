@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+use embedded_svc::http::client::Client as HttpClient;
+use embedded_svc::http::Method;
+
 const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -22,13 +26,6 @@ type Ws2812 = LedPixelEsp32Rmt<'static, RGB8, LedPixelColorRgb24>;
 
 const TCP_PORT: u16 = 1234;
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
-const BLINK_COLORS: &[(u8, u8, u8)] = &[
-    (255, 0,   0  ), // red
-    (0,   255, 0  ), // green
-    (0,   0,   255), // blue
-    (255, 255, 255), // white
-    (0,   0,   0  ), // off
-];
 const BRIGHTNESS: u8 = 64; // 25% of 255
 
 struct State {
@@ -126,8 +123,6 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
 
     let mut line = String::new();
     let mut buf = [0u8; 1];
-    let mut blink_state = 0usize;
-    let mut last_blink = Instant::now();
     let mut zap_blink_state = false;
 
     loop {
@@ -140,10 +135,7 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
                 let ch = buf[0] as char;
                 if ch == '\n' {
                     match handle_command(led, state, &line) {
-                        Response::ColorSet => {
-                            stream.write_all(b"ok\n").ok();
-                            last_blink = Instant::now() + Duration::from_secs(3600);
-                        }
+                        Response::ColorSet => { stream.write_all(b"ok\n").ok(); }
                         Response::Ok => { stream.write_all(b"ok\n").ok(); }
                         Response::Text(t) => { stream.write_all(t.as_bytes()).ok(); }
                     }
@@ -155,20 +147,44 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
             }
         }
 
-        // Tick blink
         if tick_zap_blink(led, state, &mut zap_blink_state) {
-            // zap blink takes priority, use fast interval
-        } else if last_blink.elapsed() >= BLINK_INTERVAL {
-            let (r, g, b) = BLINK_COLORS[blink_state % BLINK_COLORS.len()];
-            set_color(led, r, g, b);
-            blink_state += 1;
-            last_blink = Instant::now();
+            // zap blink in progress
+        } else if zap_blink_state {
+            set_color(led, 0, 0, 255); // restore blue after zap
+            zap_blink_state = false;
         }
     }
     info!("Client disconnected");
 }
 
+fn blynk_log_event(event_code: &str) {
+    let url = format!(
+        "https://blynk.cloud/external/api/logEvent?token={}&code={}",
+        secrets::BLYNK_TOKEN, event_code
+    );
+    let conn = EspHttpConnection::new(&HttpConfig {
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    });
+    match conn {
+        Ok(conn) => {
+            let mut client = HttpClient::wrap(conn);
+            match client.get(&url).and_then(|req| req.submit()) {
+                Ok(resp) => info!("Blynk event '{event_code}' sent, status={}", resp.status()),
+                Err(e) => info!("Blynk event send failed: {e:?}"),
+            }
+        }
+        Err(e) => info!("Blynk HTTP init failed: {e:?}"),
+    }
+}
+
 fn zap_task(mut zap_pin: PinDriver<'static, esp_idf_svc::hal::gpio::Input>, state: Arc<State>) {
+    // Wait for WiFi before attempting HTTP
+    let (lock, cvar) = &state.wifi_ready;
+    let guard = lock.lock().unwrap();
+    let _ = cvar.wait_while(guard, |ready| !*ready).unwrap();
+
     loop {
         if state.zap_flag.swap(false, Ordering::Relaxed) {
             let t = SystemTime::now();
@@ -179,6 +195,9 @@ fn zap_task(mut zap_pin: PinDriver<'static, esp_idf_svc::hal::gpio::Input>, stat
             drop(times);
             *state.zap_blink_until.lock().unwrap() =
                 Some(Instant::now() + ZAP_BLINK_DURATION);
+            blynk_log_event("zap");
+            // Debounce
+            std::thread::sleep(Duration::from_millis(100));
             zap_pin.enable_interrupt().unwrap();
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -249,40 +268,39 @@ fn main() {
     std::thread::spawn({ let s = Arc::clone(&state); move || zap_task(zap_pin, s) });
     std::thread::spawn({ let s = Arc::clone(&state); move || wifi_task(peripherals.modem, s) });
 
-    // Blink while waiting for WiFi
-    let mut blink_state = 0usize;
+    // Blink red slowly while waiting for WiFi
+    let mut red_state = false;
     let (lock, cvar) = &state.wifi_ready;
     loop {
         let guard = lock.lock().unwrap();
         let result = cvar.wait_timeout(guard, BLINK_INTERVAL).unwrap();
         if *result.0 { break; }
         drop(result);
-        let (r, g, b) = BLINK_COLORS[blink_state % BLINK_COLORS.len()];
-        set_color(&mut led, r, g, b);
-        blink_state += 1;
+        red_state = !red_state;
+        if red_state { set_color(&mut led, 255, 0, 0); } else { set_color(&mut led, 0, 0, 0); }
     }
+
+    set_color(&mut led, 0, 0, 255); // solid blue when WiFi ready
 
     let listener = TcpListener::bind(format!("0.0.0.0:{TCP_PORT}")).unwrap();
     info!("TCP server on port {TCP_PORT}");
     listener.set_nonblocking(true).unwrap();
-    let mut last_blink = Instant::now();
     let mut zap_blink_state = false;
 
     loop {
         if tick_zap_blink(&mut led, &state, &mut zap_blink_state) {
             std::thread::sleep(ZAP_BLINK_INTERVAL);
-        } else if last_blink.elapsed() >= BLINK_INTERVAL {
-            let (r, g, b) = BLINK_COLORS[blink_state % BLINK_COLORS.len()];
-            set_color(&mut led, r, g, b);
-            blink_state += 1;
-            last_blink = Instant::now();
+        } else if zap_blink_state {
+            // zap just ended, restore blue
+            set_color(&mut led, 0, 0, 255);
+            zap_blink_state = false;
         }
 
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 handle_client(stream, &mut led, &state);
-                last_blink = Instant::now();
+                set_color(&mut led, 0, 0, 255); // restore blue after client disconnects
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
