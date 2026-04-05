@@ -11,8 +11,13 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::rmt::Rmt;
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
 use log::info;
+use rgb::RGB;
+use smart_leds_trait::SmartLedsWrite as _;
 
 extern crate alloc;
 
@@ -35,6 +40,12 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
 
+    // WS2812 LED on GPIO8 (ESP32-C6 DevKit)
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
+    let mut led_buffer = smart_led_buffer!(1);
+    let mut led: SmartLedsAdapter<'_, { esp_hal_smartled::buffer_size(1) }, RGB<u8>> =
+        SmartLedsAdapter::new_with_color(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
+
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -50,10 +61,16 @@ async fn main(spawner: Spawner) -> ! {
     // TODO: Spawn some tasks
     let _ = spawner;
 
+    let mut on = false;
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        on = !on;
+        let color = if on {
+            RGB { r: 0, g: 64, b: 0 }
+        } else {
+            RGB { r: 0, g: 0, b: 0 }
+        };
+        led.write(core::iter::once(color)).unwrap();
+        info!("LED {}", if on { "on" } else { "off" });
+        Timer::after(Duration::from_millis(500)).await;
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples
 }
