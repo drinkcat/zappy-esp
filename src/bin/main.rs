@@ -14,6 +14,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::rng::Rng;
 use esp_hal::time::Rate;
@@ -150,6 +151,12 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
+    // Zap detection on GPIO4 (ESP32-C6 DevKit)
+    let mut zap_pin = Input::new(
+        peripherals.GPIO4,
+        InputConfig::default().with_pull(Pull::Down),
+    );
+
     spawner.spawn(led_task(led)).unwrap();
     spawner.spawn(wifi_task(wifi_controller)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
@@ -160,7 +167,11 @@ async fn main(spawner: Spawner) -> ! {
     }
     WIFI_CONNECTED.signal(true);
 
+    let mut zap_count: u32 = 0;
     loop {
-        Timer::after(Duration::from_secs(60)).await;
+        zap_pin.wait_for_rising_edge().await;
+        zap_count += 1;
+        info!("Zap! count={zap_count}");
+        Timer::after(Duration::from_millis(100)).await; // debounce
     }
 }
