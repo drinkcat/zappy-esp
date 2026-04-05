@@ -1,7 +1,5 @@
 mod secrets;
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -20,25 +18,23 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
 
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 use smart_leds_trait::{SmartLedsWrite, RGB8};
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 use ws2812_esp32_rmt_driver::driver::color::LedPixelColorRgb24;
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 use ws2812_esp32_rmt_driver::LedPixelEsp32Rmt;
 
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 type Led = LedPixelEsp32Rmt<'static, RGB8, LedPixelColorRgb24>;
 #[cfg(feature = "xiao_esp32c6")]
 type Led = PinDriver<'static, Output>;
 
-const TCP_PORT: u16 = 1234;
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 const BRIGHTNESS: u8 = 64; // 25% of 255
 
 struct State {
-    wifi_reconnect: AtomicBool,
     wifi_ready: (Mutex<bool>, Condvar),
     zap_flag: AtomicBool,       // set by ISR, cleared by zap_task
     zap_times: Mutex<Vec<SystemTime>>,
@@ -48,19 +44,12 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            wifi_reconnect: AtomicBool::new(false),
             wifi_ready: (Mutex::new(false), Condvar::new()),
             zap_flag: AtomicBool::new(false),
             zap_times: Mutex::new(Vec::new()),
             zap_blink_until: Mutex::new(None),
         }
     }
-}
-
-enum Response {
-    Ok,
-    ColorSet,
-    Text(String),
 }
 
 // Returns true while zap-blinking. Resets zap_blink_state to false when done.
@@ -79,20 +68,20 @@ fn tick_zap_blink(led: &mut Led, state: &State, zap_blink_state: &mut bool) -> b
     }
 }
 
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 fn set_led_color(led: &mut Led, r: u8, g: u8, b: u8) {
     let scale = |c: u8| ((c as u16 * BRIGHTNESS as u16) / 255) as u8;
     led.write(std::iter::once(RGB8 { r: scale(r), g: scale(g), b: scale(b) })).unwrap();
 }
 
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 fn set_led(led: &mut Led, on: bool) {
     // zap blink color: yellow
     let (r, g, b) = if on { (255, 200, 0) } else { (0, 0, 0) };
     set_led_color(led, r, g, b);
 }
 
-#[cfg(feature = "ws2812")]
+#[cfg(feature = "esp32c6_devkit")]
 fn set_led_wifi(led: &mut Led, on: bool) {
     // wifi blink color: blue
     let (r, g, b) = if on { (0, 0, 255) } else { (0, 0, 0) };
@@ -108,92 +97,6 @@ fn set_led(led: &mut Led, on: bool) {
 #[cfg(feature = "xiao_esp32c6")]
 fn set_led_wifi(led: &mut Led, on: bool) {
     set_led(led, on);
-}
-
-#[cfg(feature = "ws2812")]
-fn set_color(led: &mut Led, r: u8, g: u8, b: u8) {
-    set_led_color(led, r, g, b);
-}
-
-#[cfg(feature = "xiao_esp32c6")]
-fn set_color(led: &mut Led, _r: u8, _g: u8, _b: u8) {
-    // No RGB on xiao — treat any non-off color as on
-    set_led(led, true);
-}
-
-fn handle_command(led: &mut Led, state: &State, cmd: &str) -> Response {
-    let cmd = cmd.trim();
-    info!("cmd: {cmd}");
-    match cmd {
-        "red"       => { set_color(led, 255, 0, 0);        Response::ColorSet }
-        "green"     => { set_color(led, 0, 255, 0);        Response::ColorSet }
-        "blue"      => { set_color(led, 0, 0, 255);        Response::ColorSet }
-        "white"     => { set_color(led, 255, 255, 255);    Response::ColorSet }
-        "off"       => { set_led(led, false);               Response::ColorSet }
-        "reconnect" => { state.wifi_reconnect.store(true, Ordering::Relaxed); Response::Ok }
-        "zaps"      => {
-            let times = state.zap_times.lock().unwrap();
-            let n = times.len();
-            let list: String = times.iter().map(|t| {
-                let ms = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
-                format!("{ms}\n")
-            }).collect();
-            Response::Text(format!("count={n}\n{list}"))
-        }
-        _ => {
-            let parts: Vec<&str> = cmd.splitn(3, ',').collect();
-            if parts.len() == 3 {
-                if let (Ok(r), Ok(g), Ok(b)) = (
-                    parts[0].parse::<u8>(),
-                    parts[1].parse::<u8>(),
-                    parts[2].parse::<u8>(),
-                ) {
-                    set_color(led, r, g, b);
-                    return Response::ColorSet;
-                }
-            }
-            Response::Ok
-        }
-    }
-}
-
-fn handle_client(mut stream: TcpStream, led: &mut Led, state: &State) {
-    info!("Client connected: {}", stream.peer_addr().unwrap());
-    stream.write_all(b"Commands: red, green, blue, white, off, r,g,b, reconnect, zaps\n").ok();
-    stream.set_read_timeout(Some(ZAP_BLINK_INTERVAL)).ok();
-
-    let mut line = String::new();
-    let mut buf = [0u8; 1];
-    let mut zap_blink_state = false;
-
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                   || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-            Ok(_) => {
-                let ch = buf[0] as char;
-                if ch == '\n' {
-                    match handle_command(led, state, &line) {
-                        Response::ColorSet => { stream.write_all(b"ok\n").ok(); }
-                        Response::Ok => { stream.write_all(b"ok\n").ok(); }
-                        Response::Text(t) => { stream.write_all(t.as_bytes()).ok(); }
-                    }
-                    line.clear();
-                } else if ch != '\r' {
-                    line.push(ch);
-                }
-                continue;
-            }
-        }
-
-        let was_blinking = zap_blink_state;
-        if !tick_zap_blink(led, state, &mut zap_blink_state) && was_blinking {
-            set_led(led, false); // off after zap
-        }
-    }
-    info!("Client disconnected");
 }
 
 fn thingsboard_send_telemetry(key: Option<&str>) {
@@ -264,10 +167,6 @@ fn wifi_task(modem: esp_idf_svc::hal::modem::Modem, state: Arc<State>) {
     wifi.start().unwrap();
 
     loop {
-        if state.wifi_reconnect.swap(false, Ordering::Relaxed) {
-            info!("WiFi reconnect requested, disconnecting...");
-            wifi.disconnect().ok();
-        }
         if !wifi.is_connected().unwrap_or(false) {
             info!("WiFi connecting...");
             match wifi.connect() {
@@ -291,7 +190,7 @@ fn main() {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take().unwrap();
-    #[cfg(feature = "ws2812")]
+    #[cfg(feature = "esp32c6_devkit")]
     let mut led = LedPixelEsp32Rmt::new(peripherals.pins.gpio8).unwrap();
     #[cfg(feature = "xiao_esp32c6")]
     let mut led = PinDriver::output(peripherals.pins.gpio15.degrade_output()).unwrap();
@@ -302,8 +201,8 @@ fn main() {
     let state_isr = Arc::clone(&state);
     #[cfg(feature = "xiao_esp32c6")]
     let mut zap_pin = PinDriver::input(peripherals.pins.gpio2, Pull::Floating).unwrap();
-    #[cfg(feature = "ws2812")]
-    let mut zap_pin = PinDriver::input(peripherals.pins.gpio4, Pull::Down).unwrap();
+    #[cfg(feature = "esp32c6_devkit")]
+    let mut zap_pin = PinDriver::input(peripherals.pins.gpio4, Pull::Floating).unwrap();
     zap_pin.set_interrupt_type(InterruptType::PosEdge).unwrap();
     unsafe {
         zap_pin.subscribe(move || {
@@ -337,29 +236,15 @@ fn main() {
         }
     });
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{TCP_PORT}")).unwrap();
-    info!("TCP server on port {TCP_PORT}");
-    listener.set_nonblocking(true).unwrap();
     let mut zap_blink_state = false;
-
     loop {
         let was_blinking = zap_blink_state;
         if tick_zap_blink(&mut led, &state, &mut zap_blink_state) {
             std::thread::sleep(ZAP_BLINK_INTERVAL);
         } else if was_blinking {
             set_led(&mut led, false); // off after zap
-        }
-
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false).unwrap();
-                handle_client(stream, &mut led, &state);
-                set_led(&mut led, false); // off after client disconnects
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => info!("Accept error: {e}"),
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }

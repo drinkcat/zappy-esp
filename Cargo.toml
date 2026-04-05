@@ -24,8 +24,9 @@ embuild = { git = "https://github.com/esp-rs/embuild" }
 
 [features]
 default = ["xiao_esp32c6"]
-xiao_esp32c6 = []
-ws2812 = ["dep:smart-leds-trait", "dep:ws2812-esp32-rmt-driver"]
+xiao_esp32c6 = []                                   # Seeed Xiao ESP32-C6: GPIO15 LED, GPIO2 input
+esp32c6_devkit = ["dep:smart-leds-trait", "dep:ws2812-esp32-rmt-driver"]                         # ESP32-C6 DevKit: WS2812 on GPIO8, GPIO4 input
+# Note: xiao_esp32c6 and esp32c6_devkit are mutually exclusive
 
 [dependencies]
 log = "0.4"
