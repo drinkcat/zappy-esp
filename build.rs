@@ -1,7 +1,31 @@
 fn main() {
+    load_secrets();
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+}
+
+fn load_secrets() {
+    use std::collections::HashMap;
+
+    println!("cargo:rerun-if-changed=secrets.env");
+
+    let vars: HashMap<String, String> = std::fs::read_to_string("secrets.env")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && l.contains('='))
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+
+    for var in ["WIFI_SSID", "WIFI_PASSWORD"] {
+        println!(
+            "cargo:rustc-env={var}={}",
+            vars.get(var).map(String::as_str).unwrap_or_default()
+        );
+    }
 }
 
 fn linker_be_nice() {

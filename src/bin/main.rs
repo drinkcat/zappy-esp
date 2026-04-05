@@ -8,19 +8,26 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
+use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::rmt::{PulseCode, Rmt};
+use esp_hal::rng::Rng;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
+use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice};
 use log::info;
 use rgb::RGB;
 use smart_leds_trait::SmartLedsWrite as _;
 use static_cell::StaticCell;
 
 extern crate alloc;
+use alloc::string::ToString as _;
+
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -42,6 +49,31 @@ async fn led_task(mut led: LedAdapter) {
         info!("LED {}", if on { "on" } else { "off" });
         Timer::after(Duration::from_millis(500)).await;
     }
+}
+
+#[embassy_executor::task]
+async fn wifi_task(mut controller: WifiController<'static>) {
+    loop {
+        info!("WiFi connecting...");
+        match controller.connect_async().await {
+            Ok(()) => {
+                info!("WiFi connected!");
+                controller
+                    .wait_for_event(esp_radio::wifi::WifiEvent::StaDisconnected)
+                    .await;
+                info!("WiFi disconnected, reconnecting...");
+            }
+            Err(e) => {
+                info!("WiFi connect failed: {e:?}, retrying in 5s");
+                Timer::after(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
 }
 
 #[allow(
@@ -74,14 +106,45 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Embassy initialized!");
 
-    let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
+    static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
+    let radio_init =
+        RADIO_INIT.init(esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller"));
+    let (mut wifi_controller, interfaces) =
+        esp_radio::wifi::new(&*radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
+    wifi_controller
+        .set_config(&ModeConfig::Client(
+            ClientConfig::default()
+                .with_ssid(WIFI_SSID.to_string())
+                .with_password(WIFI_PASSWORD.to_string()),
+        ))
+        .expect("Failed to configure WiFi");
+    wifi_controller.start().expect("Failed to start WiFi");
+
+    let seed = {
+        let rng = Rng::new();
+        (rng.random() as u64) << 32 | rng.random() as u64
+    };
+
+    static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        interfaces.sta,
+        embassy_net::Config::dhcpv4(Default::default()),
+        STACK_RESOURCES.init(StackResources::new()),
+        seed,
+    );
+
     spawner.spawn(led_task(led)).unwrap();
+    spawner.spawn(wifi_task(wifi_controller)).unwrap();
+    spawner.spawn(net_task(runner)).unwrap();
+
+    stack.wait_config_up().await;
+    if let Some(cfg) = stack.config_v4() {
+        info!("WiFi ready, IP: {}", cfg.address);
+    }
 
     loop {
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_secs(60)).await;
     }
 }
