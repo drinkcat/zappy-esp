@@ -19,18 +19,27 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Pull};
-use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::rng::Rng;
-use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
 use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice};
 use log::info;
 use reqwless::client::HttpClient;
 use reqwless::request::{Method, RequestBuilder as _};
-use rgb::RGB;
-use smart_leds_trait::SmartLedsWrite as _;
 use static_cell::StaticCell;
+
+#[cfg(feature = "esp32c6_devkit")]
+use esp_hal::rmt::{PulseCode, Rmt};
+#[cfg(feature = "esp32c6_devkit")]
+use esp_hal::time::Rate;
+#[cfg(feature = "esp32c6_devkit")]
+use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
+#[cfg(feature = "esp32c6_devkit")]
+use rgb::RGB;
+#[cfg(feature = "esp32c6_devkit")]
+use smart_leds_trait::SmartLedsWrite as _;
+
+#[cfg(feature = "xiao_esp32c6")]
+use esp_hal::gpio::{Level, Output, OutputConfig};
 
 extern crate alloc;
 use alloc::format;
@@ -46,7 +55,11 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
+#[cfg(feature = "esp32c6_devkit")]
 type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }, RGB<u8>>;
+#[cfg(feature = "xiao_esp32c6")]
+type LedAdapter = Output<'static>;
+
 static WIFI_CONNECTED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 static ZAP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 // Channel capacity 4: buffer up to 4 zaps while HTTP is in flight
@@ -55,45 +68,54 @@ static ZAP_CHANNEL: Channel<CriticalSectionRawMutex, (), 4> = Channel::new();
 const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
 
+fn led_set(led: &mut LedAdapter, r: u8, g: u8, b: u8) {
+    #[cfg(feature = "esp32c6_devkit")]
+    led.write(core::iter::once(RGB { r, g, b })).unwrap();
+
+    // Xiao GPIO15 LED is active-low; treat any non-zero as "on"
+    #[cfg(feature = "xiao_esp32c6")]
+    led.set_level(if r > 0 || g > 0 || b > 0 {
+        Level::Low
+    } else {
+        Level::High
+    });
+}
+
 #[embassy_executor::task]
 async fn led_task(mut led: LedAdapter) {
-    // Blink blue until WiFi connects
+    // Blink blue (devkit) / on (xiao) until WiFi connects
     let mut on = false;
     loop {
         if WIFI_CONNECTED.signaled() {
             break;
         }
         on = !on;
-        let color = if on {
-            RGB { r: 0, g: 0, b: 64 } // blue
+        if on {
+            led_set(&mut led, 0, 0, 64); // blue / on
         } else {
-            RGB { r: 0, g: 0, b: 0 }
-        };
-        led.write(core::iter::once(color)).unwrap();
+            led_set(&mut led, 0, 0, 0);
+        }
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    led.write(core::iter::once(RGB { r: 0, g: 0, b: 0 }))
-        .unwrap();
+    led_set(&mut led, 0, 0, 0);
     info!("LED off (WiFi ready)");
 
     loop {
         ZAP_SIGNAL.wait().await;
-        // Blink yellow for ZAP_BLINK_DURATION
+        // Blink yellow (devkit) / on (xiao) for ZAP_BLINK_DURATION
         let deadline = embassy_time::Instant::now() + ZAP_BLINK_DURATION;
         let mut on = false;
         while embassy_time::Instant::now() < deadline {
             on = !on;
-            let color = if on {
-                RGB { r: 64, g: 50, b: 0 } // yellow
+            if on {
+                led_set(&mut led, 64, 50, 0); // yellow / on
             } else {
-                RGB { r: 0, g: 0, b: 0 }
-            };
-            led.write(core::iter::once(color)).unwrap();
+                led_set(&mut led, 0, 0, 0);
+            }
             Timer::after(ZAP_BLINK_INTERVAL).await;
         }
-        led.write(core::iter::once(RGB { r: 0, g: 0, b: 0 }))
-            .unwrap();
+        led_set(&mut led, 0, 0, 0);
     }
 }
 
@@ -190,13 +212,17 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
 
-    // WS2812 LED on GPIO8 (ESP32-C6 DevKit)
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
-    static LED_BUFFER: StaticCell<[PulseCode; esp_hal_smartled::buffer_size(1)]> =
-        StaticCell::new();
-    let led_buffer = LED_BUFFER.init(smart_led_buffer!(1));
-    let led: LedAdapter =
-        SmartLedsAdapter::new_with_color(rmt.channel0, peripherals.GPIO8, led_buffer);
+    // LED init — devkit: WS2812 on GPIO8, xiao: active-low GPIO15
+    #[cfg(feature = "esp32c6_devkit")]
+    let led: LedAdapter = {
+        let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
+        static LED_BUFFER: StaticCell<[PulseCode; esp_hal_smartled::buffer_size(1)]> =
+            StaticCell::new();
+        let led_buffer = LED_BUFFER.init(smart_led_buffer!(1));
+        SmartLedsAdapter::new_with_color(rmt.channel0, peripherals.GPIO8, led_buffer)
+    };
+    #[cfg(feature = "xiao_esp32c6")]
+    let led: LedAdapter = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -234,9 +260,15 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
-    // Zap detection on GPIO4 (ESP32-C6 DevKit)
+    // Zap pin — devkit: GPIO4, xiao: GPIO2
+    #[cfg(feature = "esp32c6_devkit")]
     let mut zap_pin = Input::new(
         peripherals.GPIO4,
+        InputConfig::default().with_pull(Pull::Down),
+    );
+    #[cfg(feature = "xiao_esp32c6")]
+    let mut zap_pin = Input::new(
+        peripherals.GPIO2,
         InputConfig::default().with_pull(Pull::Down),
     );
 
