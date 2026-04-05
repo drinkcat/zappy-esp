@@ -1,7 +1,14 @@
 // Copyright 2026 Nicolas Boichat <nicolas@boichat.ch>
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "secrets")]
 mod secrets;
+#[cfg(not(feature = "secrets"))]
+mod secrets {
+    pub const SSID: &str = "";
+    pub const PASSWORD: &str = "";
+    pub const THINGSBOARD_TOKEN: &str = "";
+}
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
