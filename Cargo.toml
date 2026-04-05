@@ -20,12 +20,22 @@ opt-level = "z"
 esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
 esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
+embuild = { git = "https://github.com/esp-rs/embuild.git" }
+
+[features]
+default = ["xiao_esp32c6"]
+xiao_esp32c6 = []                                   # Seeed Xiao ESP32-C6: GPIO15 LED, GPIO2 input
+esp32c6_devkit = ["dep:smart-leds-trait", "dep:ws2812-esp32-rmt-driver"]                         # ESP32-C6 DevKit: WS2812 on GPIO8, GPIO4 input
+# Note: xiao_esp32c6 and esp32c6_devkit are mutually exclusive
 
 [dependencies]
 log = "0.4"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+smart-leds-trait = { version = "0.3", optional = true }
+ws2812-esp32-rmt-driver = { git = "https://github.com/drinkcat/ws2812-esp32-rmt-driver", features = ["smart-leds-trait"], optional = true }
+embedded-svc = "0.29.0"
 
 [build-dependencies]
 embuild = "0.33"
