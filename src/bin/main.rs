@@ -9,6 +9,8 @@
 
 use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -34,20 +36,33 @@ const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 esp_bootloader_esp_idf::esp_app_desc!();
 
 type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }, RGB<u8>>;
+static WIFI_CONNECTED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
 #[embassy_executor::task]
 async fn led_task(mut led: LedAdapter) {
+    // Blink blue until WiFi connects
     let mut on = false;
     loop {
+        if WIFI_CONNECTED.signaled() {
+            break;
+        }
         on = !on;
         let color = if on {
-            RGB { r: 0, g: 64, b: 0 }
+            RGB { r: 0, g: 0, b: 64 } // blue
         } else {
             RGB { r: 0, g: 0, b: 0 }
         };
         led.write(core::iter::once(color)).unwrap();
-        info!("LED {}", if on { "on" } else { "off" });
         Timer::after(Duration::from_millis(500)).await;
+    }
+
+    led.write(core::iter::once(RGB { r: 0, g: 0, b: 0 }))
+        .unwrap();
+    info!("LED off (WiFi ready)");
+
+    // TODO: add post-connect LED behaviour here
+    loop {
+        Timer::after(Duration::from_secs(60)).await;
     }
 }
 
@@ -143,6 +158,7 @@ async fn main(spawner: Spawner) -> ! {
     if let Some(cfg) = stack.config_v4() {
         info!("WiFi ready, IP: {}", cfg.address);
     }
+    WIFI_CONNECTED.signal(true);
 
     loop {
         Timer::after(Duration::from_secs(60)).await;

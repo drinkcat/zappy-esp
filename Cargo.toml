@@ -68,6 +68,7 @@ static_cell      = "2.1.1"
 esp-hal-smartled = { version = "0.17.0", features = ["esp32c6"] }
 smart-leds-trait = "0.3"
 rgb = "0.8"
+embassy-sync = "0.8.0"
 
 
 [profile.dev]
