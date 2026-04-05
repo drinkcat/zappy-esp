@@ -4,11 +4,8 @@
 #[cfg(feature = "secrets")]
 mod secrets;
 #[cfg(not(feature = "secrets"))]
-mod secrets {
-    pub const SSID: &str = "";
-    pub const PASSWORD: &str = "";
-    pub const THINGSBOARD_TOKEN: &str = "";
-}
+#[path = "secrets_placeholder.rs"]
+mod secrets;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

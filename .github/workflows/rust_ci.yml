@@ -20,13 +20,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        board:
+          - xiao_esp32c6
+          - esp32c6_devkit
         action:
           - command: build
             args: --release
+            features: true
           - command: fmt
-            args: --all -- --check --color always
+            args: -- --check --color always
+            features: false
           - command: clippy
-            args: --all-targets --all-features --workspace -- -D warnings
+            args: --all-targets --workspace -- -D warnings
+            features: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,4 +46,4 @@ jobs:
       - name: Install ldproxy
         run: cargo install ldproxy
       - name: Run command
-        run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+        run: cargo ${{ matrix.action.command }} ${{ matrix.action.features && format('--no-default-features --features {0}', matrix.board) || '' }} ${{ matrix.action.args }}
