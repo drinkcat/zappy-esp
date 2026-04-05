@@ -1,12 +1,6 @@
 // Copyright 2026 Nicolas Boichat <nicolas@boichat.ch>
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(feature = "secrets")]
-mod secrets;
-#[cfg(not(feature = "secrets"))]
-#[path = "secrets_placeholder.rs"]
-mod secrets;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -114,7 +108,7 @@ fn set_led_wifi(led: &mut Led, on: bool) {
 fn thingsboard_send_telemetry(key: Option<&str>) {
     let url = format!(
         "http://thingsboard.cloud/api/v1/{}/telemetry",
-        secrets::THINGSBOARD_TOKEN
+        env!("THINGSBOARD_TOKEN")
     );
     let body = key.map_or("{}".to_string(), |k| format!("{{\"{k}\":1}}"));
 
@@ -170,8 +164,8 @@ fn wifi_task(modem: esp_idf_svc::hal::modem::Modem, state: Arc<State>) {
     .unwrap();
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: secrets::SSID.try_into().unwrap(),
-        password: secrets::PASSWORD.try_into().unwrap(),
+        ssid: env!("WIFI_SSID").try_into().unwrap(),
+        password: env!("WIFI_PASSWORD").try_into().unwrap(),
         auth_method: AuthMethod::WPA2Personal,
         ..Default::default()
     }))
