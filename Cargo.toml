@@ -22,14 +22,19 @@ esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal" }
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc" }
 embuild = { git = "https://github.com/esp-rs/embuild" }
 
+[features]
+default = ["xiao_esp32c6"]
+xiao_esp32c6 = []
+ws2812 = ["dep:smart-leds-trait", "dep:ws2812-esp32-rmt-driver"]
+
 [dependencies]
 log = "0.4"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 embedded-svc = "0.29"
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
-smart-leds-trait = "0.3"
-ws2812-esp32-rmt-driver = { git = "https://github.com/drinkcat/ws2812-esp32-rmt-driver", features = ["smart-leds-trait"] }
+smart-leds-trait = { version = "0.3", optional = true }
+ws2812-esp32-rmt-driver = { git = "https://github.com/drinkcat/ws2812-esp32-rmt-driver", features = ["smart-leds-trait"], optional = true }
 
 [build-dependencies]
 embuild = "0.33"

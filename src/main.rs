@@ -14,18 +14,27 @@ const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::gpio::{InterruptType, PinDriver, Pull};
+use esp_idf_svc::hal::gpio::{InterruptType, Output, PinDriver, Pull};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::info;
+
+#[cfg(feature = "ws2812")]
 use smart_leds_trait::{SmartLedsWrite, RGB8};
+#[cfg(feature = "ws2812")]
 use ws2812_esp32_rmt_driver::driver::color::LedPixelColorRgb24;
+#[cfg(feature = "ws2812")]
 use ws2812_esp32_rmt_driver::LedPixelEsp32Rmt;
-type Ws2812 = LedPixelEsp32Rmt<'static, RGB8, LedPixelColorRgb24>;
+
+#[cfg(feature = "ws2812")]
+type Led = LedPixelEsp32Rmt<'static, RGB8, LedPixelColorRgb24>;
+#[cfg(feature = "xiao_esp32c6")]
+type Led = PinDriver<'static, Output>;
 
 const TCP_PORT: u16 = 1234;
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(feature = "ws2812")]
 const BRIGHTNESS: u8 = 64; // 25% of 255
 
 struct State {
@@ -54,18 +63,13 @@ enum Response {
     Text(String),
 }
 
-// Returns true if currently in zap-blink mode and ticked the LED.
 // Returns true while zap-blinking. Resets zap_blink_state to false when done.
-fn tick_zap_blink(led: &mut Ws2812, state: &State, zap_blink_state: &mut bool) -> bool {
+fn tick_zap_blink(led: &mut Led, state: &State, zap_blink_state: &mut bool) -> bool {
     let until = *state.zap_blink_until.lock().unwrap();
     match until {
         Some(t) if Instant::now() < t => {
             *zap_blink_state = !*zap_blink_state;
-            if *zap_blink_state {
-                set_color_raw(led, 255, 165, 0); // orange on
-            } else {
-                set_color_raw(led, 0, 0, 0);     // off
-            }
+            set_led(led, *zap_blink_state);
             true
         }
         _ => {
@@ -75,16 +79,49 @@ fn tick_zap_blink(led: &mut Ws2812, state: &State, zap_blink_state: &mut bool) -
     }
 }
 
-fn set_color_raw(led: &mut Ws2812, r: u8, g: u8, b: u8) {
+#[cfg(feature = "ws2812")]
+fn set_led_color(led: &mut Led, r: u8, g: u8, b: u8) {
     let scale = |c: u8| ((c as u16 * BRIGHTNESS as u16) / 255) as u8;
     led.write(std::iter::once(RGB8 { r: scale(r), g: scale(g), b: scale(b) })).unwrap();
 }
 
-fn set_color(led: &mut Ws2812, r: u8, g: u8, b: u8) {
-    set_color_raw(led, r, g, b);
+#[cfg(feature = "ws2812")]
+fn set_led(led: &mut Led, on: bool) {
+    // zap blink color: yellow
+    let (r, g, b) = if on { (255, 200, 0) } else { (0, 0, 0) };
+    set_led_color(led, r, g, b);
 }
 
-fn handle_command(led: &mut Ws2812, state: &State, cmd: &str) -> Response {
+#[cfg(feature = "ws2812")]
+fn set_led_wifi(led: &mut Led, on: bool) {
+    // wifi blink color: blue
+    let (r, g, b) = if on { (0, 0, 255) } else { (0, 0, 0) };
+    set_led_color(led, r, g, b);
+}
+
+#[cfg(feature = "xiao_esp32c6")]
+fn set_led(led: &mut Led, on: bool) {
+    // GPIO15 LED is active-low
+    if on { led.set_low() } else { led.set_high() }.unwrap();
+}
+
+#[cfg(feature = "xiao_esp32c6")]
+fn set_led_wifi(led: &mut Led, on: bool) {
+    set_led(led, on);
+}
+
+#[cfg(feature = "ws2812")]
+fn set_color(led: &mut Led, r: u8, g: u8, b: u8) {
+    set_led_color(led, r, g, b);
+}
+
+#[cfg(feature = "xiao_esp32c6")]
+fn set_color(led: &mut Led, _r: u8, _g: u8, _b: u8) {
+    // No RGB on xiao — treat any non-off color as on
+    set_led(led, true);
+}
+
+fn handle_command(led: &mut Led, state: &State, cmd: &str) -> Response {
     let cmd = cmd.trim();
     info!("cmd: {cmd}");
     match cmd {
@@ -92,7 +129,7 @@ fn handle_command(led: &mut Ws2812, state: &State, cmd: &str) -> Response {
         "green"     => { set_color(led, 0, 255, 0);        Response::ColorSet }
         "blue"      => { set_color(led, 0, 0, 255);        Response::ColorSet }
         "white"     => { set_color(led, 255, 255, 255);    Response::ColorSet }
-        "off"       => { set_color(led, 0, 0, 0);          Response::ColorSet }
+        "off"       => { set_led(led, false);               Response::ColorSet }
         "reconnect" => { state.wifi_reconnect.store(true, Ordering::Relaxed); Response::Ok }
         "zaps"      => {
             let times = state.zap_times.lock().unwrap();
@@ -120,7 +157,7 @@ fn handle_command(led: &mut Ws2812, state: &State, cmd: &str) -> Response {
     }
 }
 
-fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
+fn handle_client(mut stream: TcpStream, led: &mut Led, state: &State) {
     info!("Client connected: {}", stream.peer_addr().unwrap());
     stream.write_all(b"Commands: red, green, blue, white, off, r,g,b, reconnect, zaps\n").ok();
     stream.set_read_timeout(Some(ZAP_BLINK_INTERVAL)).ok();
@@ -153,7 +190,7 @@ fn handle_client(mut stream: TcpStream, led: &mut Ws2812, state: &State) {
 
         let was_blinking = zap_blink_state;
         if !tick_zap_blink(led, state, &mut zap_blink_state) && was_blinking {
-            set_color(led, 0, 0, 255); // restore blue after zap
+            set_led(led, false); // off after zap
         }
     }
     info!("Client disconnected");
@@ -254,12 +291,18 @@ fn main() {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take().unwrap();
-    let mut led = Ws2812::new(peripherals.pins.gpio8).unwrap();
+    #[cfg(feature = "ws2812")]
+    let mut led = LedPixelEsp32Rmt::new(peripherals.pins.gpio8).unwrap();
+    #[cfg(feature = "xiao_esp32c6")]
+    let mut led = PinDriver::output(peripherals.pins.gpio15.degrade_output()).unwrap();
 
     let state = Arc::new(State::new());
 
     // Zap detection — ISR sets flag, zap_task records timestamps
     let state_isr = Arc::clone(&state);
+    #[cfg(feature = "xiao_esp32c6")]
+    let mut zap_pin = PinDriver::input(peripherals.pins.gpio2, Pull::Floating).unwrap();
+    #[cfg(feature = "ws2812")]
     let mut zap_pin = PinDriver::input(peripherals.pins.gpio4, Pull::Down).unwrap();
     zap_pin.set_interrupt_type(InterruptType::PosEdge).unwrap();
     unsafe {
@@ -272,19 +315,19 @@ fn main() {
     std::thread::spawn({ let s = Arc::clone(&state); move || zap_task(zap_pin, s) });
     std::thread::spawn({ let s = Arc::clone(&state); move || wifi_task(peripherals.modem, s) });
 
-    // Blink red slowly while waiting for WiFi
-    let mut red_state = false;
+    // Slow blink (blue/on) while waiting for WiFi
+    let mut wifi_blink_state = false;
     let (lock, cvar) = &state.wifi_ready;
     loop {
         let guard = lock.lock().unwrap();
         let result = cvar.wait_timeout(guard, BLINK_INTERVAL).unwrap();
         if *result.0 { break; }
         drop(result);
-        red_state = !red_state;
-        if red_state { set_color(&mut led, 255, 0, 0); } else { set_color(&mut led, 0, 0, 0); }
+        wifi_blink_state = !wifi_blink_state;
+        set_led_wifi(&mut led, wifi_blink_state);
     }
 
-    set_color(&mut led, 0, 0, 255); // solid blue when WiFi ready
+    set_led(&mut led, false); // off when WiFi ready (idle)
 
     std::thread::spawn(|| {
         thingsboard_send_telemetry(Some("boot"));
@@ -304,14 +347,14 @@ fn main() {
         if tick_zap_blink(&mut led, &state, &mut zap_blink_state) {
             std::thread::sleep(ZAP_BLINK_INTERVAL);
         } else if was_blinking {
-            set_color(&mut led, 0, 0, 255); // restore blue after zap
+            set_led(&mut led, false); // off after zap
         }
 
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 handle_client(stream, &mut led, &state);
-                set_color(&mut led, 0, 0, 255); // restore blue after client disconnects
+                set_led(&mut led, false); // off after client disconnects
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
