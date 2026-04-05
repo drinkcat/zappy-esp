@@ -8,6 +8,7 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Runner, Stack, StackResources};
@@ -135,10 +136,9 @@ async fn thingsboard_task(stack: Stack<'static>) {
     loop {
         // Wait for either a zap or the keepalive timer, whichever comes first
         let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
-        let key = match embassy_futures::select::select(ZAP_CHANNEL.receive(), next_keepalive).await
-        {
-            embassy_futures::select::Either::First(_) => Some("zap"),
-            embassy_futures::select::Either::Second(_) => None,
+        let key = match select(ZAP_CHANNEL.receive(), next_keepalive).await {
+            Either::First(_) => Some("zap"),
+            Either::Second(_) => None,
         };
         send_telemetry(&tcp_client, &dns, &url, key).await;
     }
@@ -161,8 +161,7 @@ async fn send_telemetry(
     match http.request(Method::POST, url).await {
         Ok(req) => {
             let headers = [("Content-Type", "application/json")];
-            let req = req.headers(&headers);
-            let mut req = req.body(body);
+            let mut req = req.headers(&headers).body(body);
             let result = req.send(&mut rx_buf).await;
             match result {
                 Ok(resp) => info!(
