@@ -3,7 +3,7 @@ target = "riscv32imac-esp-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "espflash flash --monitor -B 921600 --flash-freq 40mhz"
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]
@@ -11,8 +11,8 @@ build-std = ["std", "panic_abort"]
 
 [env]
 MCU = "esp32c6"
-ESP_IDF_VERSION = "v5.5.3"
-ESP_IDF_TOOLS_INSTALL_DIR = "global"
+ESP_IDF_VERSION = "v6.0"
+ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
 
 # Uncomment this if you have moved the target dir by setting CARGO_TARGET_DIR or similar.
 # Required for now due to embuild limitations.
