@@ -8,8 +8,11 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
+use embassy_net::dns::DnsSocket;
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_net::{Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
@@ -22,15 +25,21 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
 use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice};
 use log::info;
+use reqwless::client::HttpClient;
+use reqwless::request::{Method, RequestBuilder as _};
 use rgb::RGB;
 use smart_leds_trait::SmartLedsWrite as _;
 use static_cell::StaticCell;
 
 extern crate alloc;
+use alloc::format;
 use alloc::string::ToString as _;
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+const THINGSBOARD_TOKEN: &str = env!("THINGSBOARD_TOKEN");
+const THINGSBOARD_HOST: &str = "thingsboard.cloud";
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -39,6 +48,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }, RGB<u8>>;
 static WIFI_CONNECTED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 static ZAP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+// Channel capacity 4: buffer up to 4 zaps while HTTP is in flight
+static ZAP_CHANNEL: Channel<CriticalSectionRawMutex, (), 4> = Channel::new();
 
 const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
@@ -108,6 +119,61 @@ async fn wifi_task(mut controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn thingsboard_task(stack: Stack<'static>) {
+    static TCP_STATE: StaticCell<TcpClientState<1, 1024, 1024>> = StaticCell::new();
+    let tcp_client = TcpClient::new(stack, TCP_STATE.init(TcpClientState::new()));
+    let dns = DnsSocket::new(stack);
+
+    let url = format!("http://{THINGSBOARD_HOST}/api/v1/{THINGSBOARD_TOKEN}/telemetry");
+
+    // Send boot telemetry
+    send_telemetry(&tcp_client, &dns, &url, Some("boot")).await;
+
+    loop {
+        // Wait for either a zap or the keepalive timer, whichever comes first
+        let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
+        let key = match embassy_futures::select::select(ZAP_CHANNEL.receive(), next_keepalive).await
+        {
+            embassy_futures::select::Either::First(_) => Some("zap"),
+            embassy_futures::select::Either::Second(_) => None,
+        };
+        send_telemetry(&tcp_client, &dns, &url, key).await;
+    }
+}
+
+async fn send_telemetry(
+    client: &TcpClient<'_, 1>,
+    dns: &DnsSocket<'_>,
+    url: &str,
+    key: Option<&str>,
+) {
+    let body = key.map_or(b"{}".as_slice(), |k| match k {
+        "boot" => b"{\"boot\":1}",
+        "zap" => b"{\"zap\":1}",
+        _ => b"{}",
+    });
+
+    let mut rx_buf = [0u8; 1024];
+    let mut http = HttpClient::new(client, dns);
+    match http.request(Method::POST, url).await {
+        Ok(req) => {
+            let headers = [("Content-Type", "application/json")];
+            let req = req.headers(&headers);
+            let mut req = req.body(body);
+            let result = req.send(&mut rx_buf).await;
+            match result {
+                Ok(resp) => info!(
+                    "ThingsBoard telemetry sent (key={key:?}), status={:?}",
+                    resp.status
+                ),
+                Err(e) => info!("ThingsBoard send failed: {e:?}"),
+            }
+        }
+        Err(e) => info!("ThingsBoard connect failed: {e:?}"),
+    }
 }
 
 #[allow(
@@ -185,12 +251,15 @@ async fn main(spawner: Spawner) -> ! {
     }
     WIFI_CONNECTED.signal(true);
 
+    spawner.spawn(thingsboard_task(stack)).unwrap();
+
     let mut zap_count: u32 = 0;
     loop {
         zap_pin.wait_for_rising_edge().await;
         zap_count += 1;
         info!("Zap! count={zap_count}");
         ZAP_SIGNAL.signal(());
+        ZAP_CHANNEL.try_send(()).ok(); // best-effort, drops if channel full
         Timer::after(Duration::from_millis(100)).await; // debounce
     }
 }
