@@ -11,19 +11,38 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::rmt::Rmt;
+use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
 use log::info;
 use rgb::RGB;
 use smart_leds_trait::SmartLedsWrite as _;
+use static_cell::StaticCell;
 
 extern crate alloc;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
+
+type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }, RGB<u8>>;
+
+#[embassy_executor::task]
+async fn led_task(mut led: LedAdapter) {
+    let mut on = false;
+    loop {
+        on = !on;
+        let color = if on {
+            RGB { r: 0, g: 64, b: 0 }
+        } else {
+            RGB { r: 0, g: 0, b: 0 }
+        };
+        led.write(core::iter::once(color)).unwrap();
+        info!("LED {}", if on { "on" } else { "off" });
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
 
 #[allow(
     clippy::large_stack_frames,
@@ -42,9 +61,11 @@ async fn main(spawner: Spawner) -> ! {
 
     // WS2812 LED on GPIO8 (ESP32-C6 DevKit)
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
-    let mut led_buffer = smart_led_buffer!(1);
-    let mut led: SmartLedsAdapter<'_, { esp_hal_smartled::buffer_size(1) }, RGB<u8>> =
-        SmartLedsAdapter::new_with_color(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
+    static LED_BUFFER: StaticCell<[PulseCode; esp_hal_smartled::buffer_size(1)]> =
+        StaticCell::new();
+    let led_buffer = LED_BUFFER.init(smart_led_buffer!(1));
+    let led: LedAdapter =
+        SmartLedsAdapter::new_with_color(rmt.channel0, peripherals.GPIO8, led_buffer);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -58,19 +79,9 @@ async fn main(spawner: Spawner) -> ! {
         esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
-    // TODO: Spawn some tasks
-    let _ = spawner;
+    spawner.spawn(led_task(led)).unwrap();
 
-    let mut on = false;
     loop {
-        on = !on;
-        let color = if on {
-            RGB { r: 0, g: 64, b: 0 }
-        } else {
-            RGB { r: 0, g: 0, b: 0 }
-        };
-        led.write(core::iter::once(color)).unwrap();
-        info!("LED {}", if on { "on" } else { "off" });
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_secs(1)).await;
     }
 }
