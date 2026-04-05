@@ -38,6 +38,10 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }, RGB<u8>>;
 static WIFI_CONNECTED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+static ZAP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
+const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[embassy_executor::task]
 async fn led_task(mut led: LedAdapter) {
@@ -61,9 +65,23 @@ async fn led_task(mut led: LedAdapter) {
         .unwrap();
     info!("LED off (WiFi ready)");
 
-    // TODO: add post-connect LED behaviour here
     loop {
-        Timer::after(Duration::from_secs(60)).await;
+        ZAP_SIGNAL.wait().await;
+        // Blink yellow for ZAP_BLINK_DURATION
+        let deadline = embassy_time::Instant::now() + ZAP_BLINK_DURATION;
+        let mut on = false;
+        while embassy_time::Instant::now() < deadline {
+            on = !on;
+            let color = if on {
+                RGB { r: 64, g: 50, b: 0 } // yellow
+            } else {
+                RGB { r: 0, g: 0, b: 0 }
+            };
+            led.write(core::iter::once(color)).unwrap();
+            Timer::after(ZAP_BLINK_INTERVAL).await;
+        }
+        led.write(core::iter::once(RGB { r: 0, g: 0, b: 0 }))
+            .unwrap();
     }
 }
 
@@ -172,6 +190,7 @@ async fn main(spawner: Spawner) -> ! {
         zap_pin.wait_for_rising_edge().await;
         zap_count += 1;
         info!("Zap! count={zap_count}");
+        ZAP_SIGNAL.signal(());
         Timer::after(Duration::from_millis(100)).await; // debounce
     }
 }
