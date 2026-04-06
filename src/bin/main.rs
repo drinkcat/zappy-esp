@@ -239,7 +239,7 @@ async fn main(spawner: Spawner) -> ! {
     let board_name = "ESP32C6 DevKit";
     #[cfg(feature = "xiao_esp32c6")]
     let board_name = "Xiao ESP32C6";
-    info!("Zappy initialized for {}!", board_name);
+    info!("Zappy initialized for {}! (token: {}...)", board_name, &THINGSBOARD_TOKEN[..2]);
 
     static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
     let radio_init =
