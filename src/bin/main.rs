@@ -14,7 +14,7 @@ use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::pubsub::PubSubChannel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
@@ -62,9 +62,9 @@ type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }
 type LedAdapter = Output<'static>;
 
 static WIFI_CONNECTED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
-static ZAP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-// Channel capacity 4: buffer up to 4 zaps while HTTP is in flight
-static ZAP_CHANNEL: Channel<CriticalSectionRawMutex, (), 4> = Channel::new();
+// PubSubChannel: capacity 4, 2 subscribers (led_task + thingsboard_task), 1 publisher
+// Each subscriber has an independent read pointer, so a slow LED task won't block HTTP.
+static ZAP_PUBSUB: PubSubChannel<CriticalSectionRawMutex, (), 4, 2, 1> = PubSubChannel::new();
 
 const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
@@ -102,12 +102,16 @@ async fn led_task(mut led: LedAdapter) {
     led_set(&mut led, 0, 0, 0);
     info!("LED off (WiFi ready)");
 
+    let mut sub = ZAP_PUBSUB.subscriber().unwrap();
     loop {
-        ZAP_SIGNAL.wait().await;
+        sub.next_message_pure().await;
         // Blink yellow (devkit) / on (xiao) for ZAP_BLINK_DURATION
-        let deadline = embassy_time::Instant::now() + ZAP_BLINK_DURATION;
+        let mut deadline = embassy_time::Instant::now() + ZAP_BLINK_DURATION;
         let mut on = false;
         while embassy_time::Instant::now() < deadline {
+            if sub.try_next_message_pure().is_some() {
+                deadline = embassy_time::Instant::now() + ZAP_BLINK_DURATION;
+            }
             on = !on;
             if on {
                 led_set(&mut led, 64, 50, 0); // yellow / on
@@ -156,10 +160,11 @@ async fn thingsboard_task(stack: Stack<'static>) {
     // Send boot telemetry
     send_telemetry(&tcp_client, &dns, &url, Some("boot")).await;
 
+    let mut sub = ZAP_PUBSUB.subscriber().unwrap();
     loop {
         // Wait for either a zap or the keepalive timer, whichever comes first
         let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
-        let key = match select(ZAP_CHANNEL.receive(), next_keepalive).await {
+        let key = match select(sub.next_message_pure(), next_keepalive).await {
             Either::First(_) => Some("zap"),
             Either::Second(_) => None,
         };
@@ -286,12 +291,12 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(thingsboard_task(stack)).unwrap();
 
     let mut zap_count: u32 = 0;
+    let zap_pub = ZAP_PUBSUB.publisher().unwrap();
     loop {
         zap_pin.wait_for_rising_edge().await;
         zap_count += 1;
         info!("Zap! count={zap_count}");
-        ZAP_SIGNAL.signal(());
-        ZAP_CHANNEL.try_send(()).ok(); // best-effort, drops if channel full
+        zap_pub.publish_immediate(());
         Timer::after(Duration::from_millis(100)).await; // debounce
     }
 }
