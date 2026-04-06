@@ -235,7 +235,11 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
-    info!("Embassy initialized!");
+    #[cfg(feature = "esp32c6_devkit")]
+    let board_name = "ESP32C6 DevKit";
+    #[cfg(feature = "xiao_esp32c6")]
+    let board_name = "Xiao ESP32C6";
+    info!("Zappy initialized for {}!", board_name);
 
     static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
     let radio_init =
