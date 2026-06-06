@@ -47,7 +47,7 @@ use smart_leds_trait::SmartLedsWrite as _;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 
 extern crate alloc;
-#[cfg(feature = "thingsboard")]
+#[cfg(any(feature = "homeassistant", feature = "thingsboard"))]
 use alloc::format;
 use alloc::string::ToString as _;
 
@@ -77,9 +77,9 @@ type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }
 type LedAdapter = Output<'static>;
 
 static WIFI_CONNECTED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
-// PubSubChannel: capacity 4, 2 subscribers (led_task + thingsboard_task), 1 publisher
-// Each subscriber has an independent read pointer, so a slow LED task won't block HTTP.
-static ZAP_PUBSUB: PubSubChannel<CriticalSectionRawMutex, (), 4, 2, 1> = PubSubChannel::new();
+// PubSubChannel: capacity 4, 2 subscribers (led_task + mqtt_task), 1 publisher
+// Each subscriber has an independent read pointer, so a slow LED task won't block MQTT.
+static ZAP_PUBSUB: PubSubChannel<CriticalSectionRawMutex, u32, 4, 2, 1> = PubSubChannel::new();
 
 const ZAP_BLINK_DURATION: Duration = Duration::from_secs(5);
 const ZAP_BLINK_INTERVAL: Duration = Duration::from_millis(100);
@@ -119,7 +119,7 @@ async fn led_task(mut led: LedAdapter) {
 
     let mut sub = ZAP_PUBSUB.subscriber().unwrap();
     loop {
-        sub.next_message_pure().await;
+        sub.next_message_pure().await; // value unused by LED task
         // Blink yellow (devkit) / on (xiao) for ZAP_BLINK_DURATION
         let mut deadline = embassy_time::Instant::now() + ZAP_BLINK_DURATION;
         let mut on = false;
@@ -293,21 +293,48 @@ async fn mqtt_task(stack: Stack<'static>) {
 
         let boot_topic = TopicName::new(MqttString::try_from("zappy/boot").unwrap()).unwrap();
         let zap_topic = TopicName::new(MqttString::try_from("zappy/zap").unwrap()).unwrap();
-        let pub_opts = PublicationOptions::new(TopicReference::Name(boot_topic));
-        if let Err(e) = client.publish(&pub_opts, Bytes::from(b"1".as_slice())).await {
-            info!("MQTT boot publish failed: {e:?}");
-        } else {
-            info!("MQTT boot published");
+
+        // MQTT discovery — HA auto-creates entities from these config messages
+        let disc_zap_topic =
+            TopicName::new(MqttString::try_from("homeassistant/sensor/zappy/zap/config").unwrap())
+                .unwrap();
+        let disc_boot_topic = TopicName::new(
+            MqttString::try_from("homeassistant/sensor/zappy/boot/config").unwrap(),
+        )
+        .unwrap();
+        let disc_zap_payload = br#"{"name":"Zappy Zap Count","state_topic":"zappy/zap","unique_id":"zappy_zap_count","state_class":"total_increasing","device":{"identifiers":["zappy"],"name":"Zappy"}}"#;
+        let disc_boot_payload = br#"{"name":"Zappy Boot","state_topic":"zappy/boot","unique_id":"zappy_boot","device":{"identifiers":["zappy"],"name":"Zappy"}}"#;
+        for (topic, payload) in [
+            (disc_zap_topic, disc_zap_payload.as_slice()),
+            (disc_boot_topic, disc_boot_payload.as_slice()),
+        ] {
+            let opts = PublicationOptions::new(TopicReference::Name(topic));
+            if let Err(e) = client.publish(&opts, Bytes::from(payload)).await {
+                info!("MQTT discovery publish failed: {e:?}");
+            }
+        }
+        info!("MQTT discovery published");
+
+        let boot_opts = PublicationOptions::new(TopicReference::Name(boot_topic));
+        let zap_opts = PublicationOptions::new(TopicReference::Name(zap_topic.clone()));
+        let boot_ok = client.publish(&boot_opts, Bytes::from(b"1".as_slice())).await;
+        let zap_ok = client.publish(&zap_opts, Bytes::from(b"0".as_slice())).await;
+        match (boot_ok, zap_ok) {
+            (Ok(_), Ok(_)) => info!("MQTT boot published"),
+            (Err(e), _) | (_, Err(e)) => {
+                info!("MQTT boot publish failed: {e:?}");
+            }
         }
 
         'connected: loop {
             let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
             match select(sub.next_message_pure(), next_keepalive).await {
-                Either::First(_) => {
+                Either::First(count) => {
+                    let payload = alloc::format!("{count}");
                     let pub_opts =
                         PublicationOptions::new(TopicReference::Name(zap_topic.clone()));
-                    match client.publish(&pub_opts, Bytes::from(b"1".as_slice())).await {
-                        Ok(_) => info!("MQTT zap published"),
+                    match client.publish(&pub_opts, Bytes::from(payload.as_bytes())).await {
+                        Ok(_) => info!("MQTT zap published (count={count}"),
                         Err(e) => {
                             info!("MQTT zap publish failed: {e:?}, reconnecting");
                             break 'connected;
@@ -480,7 +507,7 @@ async fn main(spawner: Spawner) -> ! {
         zap_pin.wait_for_rising_edge().await;
         zap_count += 1;
         info!("Zap! count={zap_count}");
-        zap_pub.publish_immediate(());
+        zap_pub.publish_immediate(zap_count);
         Timer::after(Duration::from_millis(100)).await; // debounce
     }
 }
