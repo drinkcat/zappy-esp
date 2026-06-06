@@ -271,7 +271,7 @@ async fn mqtt_task(stack: Stack<'static>) {
         }
 
         let mut buffer = AllocBuffer;
-        let mut client = Client::<'_, _, _, 0, 0, 0, 0>::new(&mut buffer);
+        let mut client = Client::<'_, _, _, 0, 1, 1, 0>::new(&mut buffer);
 
         let connect_opts = ConnectOptions::new()
             .clean_start()
