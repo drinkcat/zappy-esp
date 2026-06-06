@@ -20,7 +20,7 @@ fn load_secrets() {
         })
         .collect();
 
-    for var in ["WIFI_SSID", "WIFI_PASSWORD", "THINGSBOARD_TOKEN"] {
+    for var in ["WIFI_SSID", "WIFI_PASSWORD", "THINGSBOARD_TOKEN", "HA_HOST", "HA_USER", "HA_TOKEN"] {
         println!(
             "cargo:rustc-env={var}={}",
             vars.get(var).map(String::as_str).unwrap_or_default()

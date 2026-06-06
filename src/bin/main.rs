@@ -10,9 +10,11 @@
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
-use embassy_net::dns::DnsSocket;
-use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Runner, Stack, StackResources};
+#[cfg(feature = "thingsboard")]
+use embassy_net::dns::DnsSocket;
+#[cfg(feature = "thingsboard")]
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::PubSubChannel;
 use embassy_sync::signal::Signal;
@@ -24,7 +26,9 @@ use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice};
 use log::info;
+#[cfg(feature = "thingsboard")]
 use reqwless::client::HttpClient;
+#[cfg(feature = "thingsboard")]
 use reqwless::request::{Method, RequestBuilder as _};
 use static_cell::StaticCell;
 
@@ -43,14 +47,25 @@ use smart_leds_trait::SmartLedsWrite as _;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 
 extern crate alloc;
+#[cfg(feature = "thingsboard")]
 use alloc::format;
 use alloc::string::ToString as _;
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
-const THINGSBOARD_TOKEN: &str = env!("THINGSBOARD_TOKEN");
-const THINGSBOARD_HOST: &str = "thingsboard.cloud";
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[cfg(feature = "thingsboard")]
+const THINGSBOARD_TOKEN: &str = env!("THINGSBOARD_TOKEN");
+#[cfg(feature = "thingsboard")]
+const THINGSBOARD_HOST: &str = "thingsboard.cloud";
+
+#[cfg(feature = "homeassistant")]
+const HA_HOST: &str = env!("HA_HOST");
+#[cfg(feature = "homeassistant")]
+const HA_USER: &str = env!("HA_USER");
+#[cfg(feature = "homeassistant")]
+const HA_TOKEN: &str = env!("HA_TOKEN");
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -149,6 +164,169 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
 }
 
+// Shim: embassy-net's TcpSocket implements embedded-io-async v0.6, but rust-mqtt
+// requires v0.7. This wrapper bridges between the two versions.
+#[cfg(feature = "homeassistant")]
+extern crate embedded_io_async_v6;
+
+#[cfg(feature = "homeassistant")]
+#[derive(Debug)]
+struct TcpError(embassy_net::tcp::Error);
+
+#[cfg(feature = "homeassistant")]
+impl core::fmt::Display for TcpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+#[cfg(feature = "homeassistant")]
+impl core::error::Error for TcpError {}
+
+#[cfg(feature = "homeassistant")]
+impl embedded_io_async::Error for TcpError {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        embedded_io_async::ErrorKind::Other
+    }
+}
+
+#[cfg(feature = "homeassistant")]
+struct TcpShim<'a>(embassy_net::tcp::TcpSocket<'a>);
+
+#[cfg(feature = "homeassistant")]
+impl embedded_io_async::ErrorType for TcpShim<'_> {
+    type Error = TcpError;
+}
+
+#[cfg(feature = "homeassistant")]
+impl embedded_io_async::Read for TcpShim<'_> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        embedded_io_async_v6::Read::read(&mut self.0, buf)
+            .await
+            .map_err(TcpError)
+    }
+}
+
+#[cfg(feature = "homeassistant")]
+impl embedded_io_async::Write for TcpShim<'_> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        embedded_io_async_v6::Write::write(&mut self.0, buf)
+            .await
+            .map_err(TcpError)
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        embedded_io_async_v6::Write::flush(&mut self.0)
+            .await
+            .map_err(TcpError)
+    }
+}
+
+#[cfg(feature = "homeassistant")]
+#[embassy_executor::task]
+async fn mqtt_task(stack: Stack<'static>) {
+    use core::num::NonZero;
+    use rust_mqtt::{
+        Bytes,
+        buffer::AllocBuffer,
+        client::{
+            Client,
+            options::{ConnectOptions, PublicationOptions, TopicReference},
+        },
+        config::KeepAlive,
+        types::{MqttBinary, MqttString, TopicName},
+    };
+
+    let mut sub = ZAP_PUBSUB.subscriber().unwrap();
+
+    loop {
+        info!("MQTT connecting to {}...", HA_HOST);
+        let tcp = embassy_net::tcp::TcpSocket::new(
+            stack,
+            {
+                static RX: StaticCell<[u8; 1024]> = StaticCell::new();
+                RX.init([0; 1024])
+            },
+            {
+                static TX: StaticCell<[u8; 1024]> = StaticCell::new();
+                TX.init([0; 1024])
+            },
+        );
+
+        let remote = match stack.dns_query(HA_HOST, embassy_net::dns::DnsQueryType::A).await {
+            Ok(addrs) if !addrs.is_empty() => embassy_net::IpEndpoint::new(addrs[0], 1883),
+            _ => {
+                info!("MQTT DNS failed, retrying in 10s");
+                Timer::after(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        let mut shim = TcpShim(tcp);
+        shim.0.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+        if let Err(e) = shim.0.connect(remote).await {
+            info!("MQTT TCP connect failed: {e:?}, retrying in 10s");
+            Timer::after(Duration::from_secs(10)).await;
+            continue;
+        }
+
+        let mut buffer = AllocBuffer;
+        let mut client = Client::<'_, _, _, 0, 0, 0, 0>::new(&mut buffer);
+
+        let connect_opts = ConnectOptions::new()
+            .clean_start()
+            .keep_alive(KeepAlive::Seconds(NonZero::new(60).unwrap()))
+            .user_name(MqttString::try_from(HA_USER).unwrap())
+            .password(MqttBinary::try_from(HA_TOKEN.as_bytes()).unwrap());
+
+        match client
+            .connect(shim, &connect_opts, Some(MqttString::try_from("zappy").unwrap()))
+            .await
+        {
+            Ok(_) => info!("MQTT connected"),
+            Err(e) => {
+                info!("MQTT connect failed: {e:?}, retrying in 10s");
+                Timer::after(Duration::from_secs(10)).await;
+                continue;
+            }
+        }
+
+        let boot_topic = TopicName::new(MqttString::try_from("zappy/boot").unwrap()).unwrap();
+        let zap_topic = TopicName::new(MqttString::try_from("zappy/zap").unwrap()).unwrap();
+        let pub_opts = PublicationOptions::new(TopicReference::Name(boot_topic));
+        if let Err(e) = client.publish(&pub_opts, Bytes::from(b"1".as_slice())).await {
+            info!("MQTT boot publish failed: {e:?}");
+        } else {
+            info!("MQTT boot published");
+        }
+
+        'connected: loop {
+            let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
+            match select(sub.next_message_pure(), next_keepalive).await {
+                Either::First(_) => {
+                    let pub_opts =
+                        PublicationOptions::new(TopicReference::Name(zap_topic.clone()));
+                    match client.publish(&pub_opts, Bytes::from(b"1".as_slice())).await {
+                        Ok(_) => info!("MQTT zap published"),
+                        Err(e) => {
+                            info!("MQTT zap publish failed: {e:?}, reconnecting");
+                            break 'connected;
+                        }
+                    }
+                }
+                Either::Second(_) => match client.ping().await {
+                    Ok(()) => info!("MQTT ping ok"),
+                    Err(e) => {
+                        info!("MQTT ping failed: {e:?}, reconnecting");
+                        break 'connected;
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[cfg(feature = "thingsboard")]
 #[embassy_executor::task]
 async fn thingsboard_task(stack: Stack<'static>) {
     static TCP_STATE: StaticCell<TcpClientState<1, 1024, 1024>> = StaticCell::new();
@@ -157,12 +335,10 @@ async fn thingsboard_task(stack: Stack<'static>) {
 
     let url = format!("http://{THINGSBOARD_HOST}/api/v1/{THINGSBOARD_TOKEN}/telemetry");
 
-    // Send boot telemetry
     send_telemetry(&tcp_client, &dns, &url, Some("boot")).await;
 
     let mut sub = ZAP_PUBSUB.subscriber().unwrap();
     loop {
-        // Wait for either a zap or the keepalive timer, whichever comes first
         let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
         let key = match select(sub.next_message_pure(), next_keepalive).await {
             Either::First(_) => Some("zap"),
@@ -172,6 +348,7 @@ async fn thingsboard_task(stack: Stack<'static>) {
     }
 }
 
+#[cfg(feature = "thingsboard")]
 async fn send_telemetry(
     client: &TcpClient<'_, 1>,
     dns: &DnsSocket<'_>,
@@ -239,7 +416,7 @@ async fn main(spawner: Spawner) -> ! {
     let board_name = "ESP32C6 DevKit";
     #[cfg(feature = "xiao_esp32c6")]
     let board_name = "Xiao ESP32C6";
-    info!("Zappy initialized for {}! (token: {}...)", board_name, &THINGSBOARD_TOKEN[..2]);
+    info!("Zappy initialized for {}!", board_name);
 
     static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
     let radio_init =
@@ -292,6 +469,9 @@ async fn main(spawner: Spawner) -> ! {
     }
     WIFI_CONNECTED.signal(true);
 
+    #[cfg(feature = "homeassistant")]
+    spawner.spawn(mqtt_task(stack)).unwrap();
+    #[cfg(feature = "thingsboard")]
     spawner.spawn(thingsboard_task(stack)).unwrap();
 
     let mut zap_count: u32 = 0;
