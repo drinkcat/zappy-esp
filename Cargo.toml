@@ -22,7 +22,7 @@ esp-rtos = { version = "0.2.0", features = [
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c6", "log-04"] }
 log                    = "0.4.27"
 
-embassy-net = { version = "0.7.1", features = [
+embassy-net = { version = "0.9", features = [
   "dhcpv4",
   "dns",
   "log",
@@ -33,7 +33,6 @@ embassy-net = { version = "0.7.1", features = [
 embassy-futures = "0.1.1"
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
-embedded-io-async-v6 = { package = "embedded-io-async", version = "0.6.1", optional = true }
 esp-alloc = "0.9.0"
 esp-backtrace = { version = "0.18.1", features = [
   "esp32c6",
@@ -81,7 +80,7 @@ rust-mqtt          = { version = "0.5.1", default-features = false, features = [
 default        = ["xiao_esp32c6", "homeassistant"]
 xiao_esp32c6   = []                                                          # Seeed Xiao ESP32-C6: GPIO15 LED, GPIO2 input
 esp32c6_devkit = ["dep:esp-hal-smartled", "dep:smart-leds-trait", "dep:rgb"] # ESP32-C6 DevKit: WS2812 on GPIO8, GPIO4 input
-homeassistant  = ["dep:rust-mqtt", "dep:embedded-io-async-v6"]               # Publish to Home Assistant via MQTT
+homeassistant  = ["dep:rust-mqtt"]                                           # Publish to Home Assistant via MQTT
 thingsboard    = ["dep:reqwless", "dep:embedded-nal-async"]                  # Publish to ThingsBoard via HTTP
 
 

@@ -47,8 +47,6 @@ use smart_leds_trait::SmartLedsWrite as _;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 
 extern crate alloc;
-#[cfg(any(feature = "homeassistant", feature = "thingsboard"))]
-use alloc::format;
 use alloc::string::ToString as _;
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
@@ -164,64 +162,6 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
 }
 
-// Shim: embassy-net's TcpSocket implements embedded-io-async v0.6, but rust-mqtt
-// requires v0.7. This wrapper bridges between the two versions.
-#[cfg(feature = "homeassistant")]
-extern crate embedded_io_async_v6;
-
-#[cfg(feature = "homeassistant")]
-#[derive(Debug)]
-struct TcpError(embassy_net::tcp::Error);
-
-#[cfg(feature = "homeassistant")]
-impl core::fmt::Display for TcpError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
-}
-
-#[cfg(feature = "homeassistant")]
-impl core::error::Error for TcpError {}
-
-#[cfg(feature = "homeassistant")]
-impl embedded_io_async::Error for TcpError {
-    fn kind(&self) -> embedded_io_async::ErrorKind {
-        embedded_io_async::ErrorKind::Other
-    }
-}
-
-#[cfg(feature = "homeassistant")]
-struct TcpShim<'a>(embassy_net::tcp::TcpSocket<'a>);
-
-#[cfg(feature = "homeassistant")]
-impl embedded_io_async::ErrorType for TcpShim<'_> {
-    type Error = TcpError;
-}
-
-#[cfg(feature = "homeassistant")]
-impl embedded_io_async::Read for TcpShim<'_> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        embedded_io_async_v6::Read::read(&mut self.0, buf)
-            .await
-            .map_err(TcpError)
-    }
-}
-
-#[cfg(feature = "homeassistant")]
-impl embedded_io_async::Write for TcpShim<'_> {
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        embedded_io_async_v6::Write::write(&mut self.0, buf)
-            .await
-            .map_err(TcpError)
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        embedded_io_async_v6::Write::flush(&mut self.0)
-            .await
-            .map_err(TcpError)
-    }
-}
-
 #[cfg(feature = "homeassistant")]
 #[embassy_executor::task]
 async fn mqtt_task(stack: Stack<'static>) {
@@ -241,7 +181,7 @@ async fn mqtt_task(stack: Stack<'static>) {
 
     loop {
         info!("MQTT connecting to {}...", HA_HOST);
-        let tcp = embassy_net::tcp::TcpSocket::new(
+        let mut sock = embassy_net::tcp::TcpSocket::new(
             stack,
             {
                 static RX: StaticCell<[u8; 1024]> = StaticCell::new();
@@ -262,9 +202,8 @@ async fn mqtt_task(stack: Stack<'static>) {
             }
         };
 
-        let mut shim = TcpShim(tcp);
-        shim.0.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-        if let Err(e) = shim.0.connect(remote).await {
+        sock.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+        if let Err(e) = sock.connect(remote).await {
             info!("MQTT TCP connect failed: {e:?}, retrying in 10s");
             Timer::after(Duration::from_secs(10)).await;
             continue;
@@ -280,7 +219,7 @@ async fn mqtt_task(stack: Stack<'static>) {
             .password(MqttBinary::try_from(HA_TOKEN.as_bytes()).unwrap());
 
         match client
-            .connect(shim, &connect_opts, Some(MqttString::try_from("zappy").unwrap()))
+            .connect(sock, &connect_opts, Some(MqttString::try_from("zappy").unwrap()))
             .await
         {
             Ok(_) => info!("MQTT connected"),
@@ -417,7 +356,9 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::logger::init_logger_from_env();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // 80 MHz is plenty for blinking an LED and publishing the occasional MQTT
+    // message; running below max keeps the core cooler.
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
@@ -460,6 +401,12 @@ async fn main(spawner: Spawner) -> ! {
         ))
         .expect("Failed to configure WiFi");
     wifi_controller.start().expect("Failed to start WiFi");
+    // Enable modem-sleep: the radio sleeps between DTIM beacons instead of
+    // staying fully powered. This is the main idle-power/heat saver for a
+    // mostly-quiet, publish-only device.
+    wifi_controller
+        .set_power_saving(esp_radio::wifi::PowerSaveMode::Minimum)
+        .expect("Failed to set WiFi power saving");
 
     let seed = {
         let rng = Rng::new();
