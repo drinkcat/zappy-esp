@@ -9,6 +9,8 @@
 //#![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either3, select3};
+#[cfg(feature = "thingsboard")]
 use embassy_futures::select::{Either, select};
 use embassy_net::{Runner, Stack, StackResources};
 #[cfg(feature = "thingsboard")]
@@ -51,7 +53,11 @@ use alloc::string::ToString as _;
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// MQTT keepalive advertised to the broker, and how often we ping. The ping
+// interval must be well under the keepalive or the broker drops us (it allows
+// up to 1.5x keepalive without a packet).
+const MQTT_KEEPALIVE_SECS: u16 = 60;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "thingsboard")]
 const THINGSBOARD_TOKEN: &str = env!("THINGSBOARD_TOKEN");
@@ -68,6 +74,13 @@ const HA_TOKEN: &str = env!("HA_TOKEN");
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
+
+// Timestamp source for esp-println's `timestamp` feature: milliseconds since
+// boot from embassy-time's monotonic clock. Logs become "INFO (12345) - msg".
+#[unsafe(no_mangle)]
+extern "Rust" fn _esp_println_timestamp() -> u64 {
+    embassy_time::Instant::now().as_millis()
+}
 
 #[cfg(feature = "esp32c6_devkit")]
 type LedAdapter = SmartLedsAdapter<'static, { esp_hal_smartled::buffer_size(1) }, RGB<u8>>;
@@ -179,19 +192,29 @@ async fn mqtt_task(stack: Stack<'static>) {
 
     let mut sub = ZAP_PUBSUB.subscriber().unwrap();
 
+    // Unique, stable MQTT client id derived from the STA MAC. A shared id like
+    // "zappy" gets evicted (Disconnect: SessionTakenOver) whenever anything else
+    // connects with the same id, causing an endless reconnect storm.
+    let mac = esp_radio::wifi::sta_mac();
+    let client_id = alloc::format!(
+        "zappy-{:02x}{:02x}{:02x}",
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+    info!("MQTT client id: {client_id}");
+
+    // Socket buffers must be initialized exactly once — a StaticCell panics if
+    // init twice, so these live outside the reconnect loop. The TcpSocket
+    // borrows them fresh on each iteration.
+    static RX: StaticCell<[u8; 1024]> = StaticCell::new();
+    static TX: StaticCell<[u8; 1024]> = StaticCell::new();
+    let rx_buf = RX.init([0; 1024]);
+    let tx_buf = TX.init([0; 1024]);
+
     loop {
         info!("MQTT connecting to {}...", HA_HOST);
-        let mut sock = embassy_net::tcp::TcpSocket::new(
-            stack,
-            {
-                static RX: StaticCell<[u8; 1024]> = StaticCell::new();
-                RX.init([0; 1024])
-            },
-            {
-                static TX: StaticCell<[u8; 1024]> = StaticCell::new();
-                TX.init([0; 1024])
-            },
-        );
+        let mut sock = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buf[..], &mut tx_buf[..]);
 
         let remote = match stack.dns_query(HA_HOST, embassy_net::dns::DnsQueryType::A).await {
             Ok(addrs) if !addrs.is_empty() => embassy_net::IpEndpoint::new(addrs[0], 1883),
@@ -202,7 +225,13 @@ async fn mqtt_task(stack: Stack<'static>) {
             }
         };
 
-        sock.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+        // The TCP idle timeout must exceed the MQTT ping interval, or the
+        // socket closes itself between pings (broker logs "connection closed by
+        // client") and we reconnect forever. Give it generous room past the
+        // ping interval so a single slow round-trip doesn't tear down the socket.
+        sock.set_timeout(Some(embassy_time::Duration::from_secs(
+            MQTT_KEEPALIVE_SECS as u64 * 2,
+        )));
         if let Err(e) = sock.connect(remote).await {
             info!("MQTT TCP connect failed: {e:?}, retrying in 10s");
             Timer::after(Duration::from_secs(10)).await;
@@ -214,12 +243,16 @@ async fn mqtt_task(stack: Stack<'static>) {
 
         let connect_opts = ConnectOptions::new()
             .clean_start()
-            .keep_alive(KeepAlive::Seconds(NonZero::new(60).unwrap()))
+            .keep_alive(KeepAlive::Seconds(NonZero::new(MQTT_KEEPALIVE_SECS).unwrap()))
             .user_name(MqttString::try_from(HA_USER).unwrap())
             .password(MqttBinary::try_from(HA_TOKEN.as_bytes()).unwrap());
 
         match client
-            .connect(sock, &connect_opts, Some(MqttString::try_from("zappy").unwrap()))
+            .connect(
+                sock,
+                &connect_opts,
+                Some(MqttString::try_from(client_id.as_str()).unwrap()),
+            )
             .await
         {
             Ok(_) => info!("MQTT connected"),
@@ -273,23 +306,36 @@ async fn mqtt_task(stack: Stack<'static>) {
 
         'connected: loop {
             let next_keepalive = Timer::after(KEEPALIVE_INTERVAL);
-            match select(sub.next_message_pure(), next_keepalive).await {
-                Either::First(count) => {
+            // rust-mqtt is poll-driven: client.poll() is what reads incoming
+            // packets (PINGRESP, broker control traffic). Without it the socket
+            // RX backs up and the broker resets the connection within a
+            // keepalive period. poll() races here so we drain it continuously;
+            // poll_header (where it idles) is cancel-safe, so dropping it when
+            // another branch wins is fine.
+            match select3(sub.next_message_pure(), next_keepalive, client.poll()).await {
+                Either3::First(count) => {
                     let payload = alloc::format!("{count}");
                     let pub_opts =
                         PublicationOptions::new(TopicReference::Name(zap_topic.clone())).retain();
                     match client.publish(&pub_opts, Bytes::from(payload.as_bytes())).await {
-                        Ok(_) => info!("MQTT zap published (count={count}"),
+                        Ok(_) => info!("MQTT zap published (count={count})"),
                         Err(e) => {
                             info!("MQTT zap publish failed: {e:?}, reconnecting");
                             break 'connected;
                         }
                     }
                 }
-                Either::Second(_) => match client.ping().await {
+                Either3::Second(_) => match client.ping().await {
                     Ok(()) => info!("MQTT ping ok"),
                     Err(e) => {
                         info!("MQTT ping failed: {e:?}, reconnecting");
+                        break 'connected;
+                    }
+                },
+                Either3::Third(result) => match result {
+                    Ok(_event) => {} // drained an incoming packet (e.g. PINGRESP)
+                    Err(e) => {
+                        info!("MQTT poll failed: {e:?}, reconnecting");
                         break 'connected;
                     }
                 },
@@ -407,12 +453,8 @@ async fn main(spawner: Spawner) -> ! {
         ))
         .expect("Failed to configure WiFi");
     wifi_controller.start().expect("Failed to start WiFi");
-    // Enable modem-sleep: the radio sleeps between DTIM beacons instead of
-    // staying fully powered. This is the main idle-power/heat saver for a
-    // mostly-quiet, publish-only device.
-    wifi_controller
-        .set_power_saving(esp_radio::wifi::PowerSaveMode::Minimum)
-        .expect("Failed to set WiFi power saving");
+    // WiFi power-save left at the default (None): modem-sleep added too much
+    // latency to MQTT publishes/keepalives for a responsive device.
 
     let seed = {
         let rng = Rng::new();
