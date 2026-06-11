@@ -242,20 +242,26 @@ async fn mqtt_task(stack: Stack<'static>) {
         )
         .unwrap();
         let disc_zap_payload = br#"{"name":"Zappy Zap Count","state_topic":"zappy/zap","unique_id":"zappy_zap_count","state_class":"total_increasing","device":{"identifiers":["zappy"],"name":"Zappy"}}"#;
-        let disc_boot_payload = br#"{"name":"Zappy Boot","state_topic":"zappy/boot","unique_id":"zappy_boot","device":{"identifiers":["zappy"],"name":"Zappy"}}"#;
+        // force_update lets HA register each boot=1 even though the value never
+        // changes; omit it from the zap sensor, which is total_increasing.
+        let disc_boot_payload = br#"{"name":"Zappy Boot","state_topic":"zappy/boot","unique_id":"zappy_boot","force_update":true,"device":{"identifiers":["zappy"],"name":"Zappy"}}"#;
         for (topic, payload) in [
             (disc_zap_topic, disc_zap_payload.as_slice()),
             (disc_boot_topic, disc_boot_payload.as_slice()),
         ] {
-            let opts = PublicationOptions::new(TopicReference::Name(topic));
+            // Retain discovery configs so HA keeps the entities across restarts
+            // instead of losing them until the device next reconnects.
+            let opts = PublicationOptions::new(TopicReference::Name(topic)).retain();
             if let Err(e) = client.publish(&opts, Bytes::from(payload)).await {
                 info!("MQTT discovery publish failed: {e:?}");
             }
         }
         info!("MQTT discovery published");
 
-        let boot_opts = PublicationOptions::new(TopicReference::Name(boot_topic));
-        let zap_opts = PublicationOptions::new(TopicReference::Name(zap_topic.clone()));
+        // Retain state too, so HA shows the last value between the device's
+        // brief connection windows instead of going blank.
+        let boot_opts = PublicationOptions::new(TopicReference::Name(boot_topic)).retain();
+        let zap_opts = PublicationOptions::new(TopicReference::Name(zap_topic.clone())).retain();
         let boot_ok = client.publish(&boot_opts, Bytes::from(b"1".as_slice())).await;
         let zap_ok = client.publish(&zap_opts, Bytes::from(b"0".as_slice())).await;
         match (boot_ok, zap_ok) {
@@ -271,7 +277,7 @@ async fn mqtt_task(stack: Stack<'static>) {
                 Either::First(count) => {
                     let payload = alloc::format!("{count}");
                     let pub_opts =
-                        PublicationOptions::new(TopicReference::Name(zap_topic.clone()));
+                        PublicationOptions::new(TopicReference::Name(zap_topic.clone())).retain();
                     match client.publish(&pub_opts, Bytes::from(payload.as_bytes())).await {
                         Ok(_) => info!("MQTT zap published (count={count}"),
                         Err(e) => {
